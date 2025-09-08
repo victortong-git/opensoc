@@ -1,0 +1,1251 @@
+const { models, sequelize } = require('../database/models');
+const { asyncHandler, NotFoundError, ValidationError } = require('../middleware/error.middleware');
+const { Op } = require('sequelize');
+const aiGenerationService = require('../services/aiGenerationService');
+const { createAlertHelper } = require('./alerts.controller');
+const { createIncidentHelper } = require('./incidents.controller');
+const { createAssetHelper } = require('./assets.controller');
+const { createIOCHelper } = require('./ioc.controller');
+const { createPlaybookHelper } = require('./playbooks.controller');
+const { createThreatActorBulkHelper, createThreatCampaignBulkHelper } = require('./threat-intel.controller');
+const embeddingHelper = require('../services/embeddingHelper');
+const { v4: uuidv4 } = require('uuid');
+
+/**
+ * Verify that records were actually created in the database
+ * @param {string} dataType - Type of data (alert, incident, asset, ioc, playbook)
+ * @param {Array} recordIds - Array of record IDs to verify
+ * @param {string} organizationId - Organization ID for filtering
+ * @returns {Promise<Object>} Verification result with success status and details
+ */
+const verifyDatabaseRecords = async (dataType, recordIds, organizationId) => {
+  if (!Array.isArray(recordIds) || recordIds.length === 0) {
+    return {
+      success: false,
+      verified: 0,
+      expected: 0,
+      missing: [],
+      error: 'No record IDs provided for verification'
+    };
+  }
+
+  try {
+    let model;
+    let tableName;
+    
+    switch (dataType) {
+      case 'alert':
+        model = models.Alert;
+        tableName = 'alerts';
+        break;
+      case 'incident':
+        model = models.Incident;
+        tableName = 'incidents';
+        break;
+      case 'asset':
+        model = models.Asset;
+        tableName = 'assets';
+        break;
+      case 'ioc':
+        model = models.IOC;
+        tableName = 'iocs';
+        break;
+      case 'playbook':
+        model = models.Playbook;
+        tableName = 'playbooks';
+        break;
+      case 'threat_actor':
+        model = models.ThreatActor;
+        tableName = 'threat_actors';
+        break;
+      case 'threat_campaign':
+        model = models.ThreatCampaign;
+        tableName = 'threat_campaigns';
+        break;
+      default:
+        return {
+          success: false,
+          verified: 0,
+          expected: recordIds.length,
+          missing: recordIds,
+          error: `Invalid data type: ${dataType}`
+        };
+    }
+
+    // Query database to find existing records
+    const existingRecords = await model.findAll({
+      where: {
+        id: { [Op.in]: recordIds },
+        organizationId: organizationId,
+        isTestData: true
+      },
+      attributes: ['id']
+    });
+
+    const existingIds = existingRecords.map(record => record.id);
+    const missingIds = recordIds.filter(id => !existingIds.includes(id));
+
+    const success = missingIds.length === 0;
+    const verified = existingIds.length;
+    const expected = recordIds.length;
+
+    return {
+      success,
+      verified,
+      expected,
+      missing: missingIds,
+      existing: existingIds,
+      tableName,
+      error: success ? null : `${missingIds.length} records missing from database`
+    };
+
+  } catch (error) {
+    console.error(`Database verification failed for ${dataType}:`, error);
+    return {
+      success: false,
+      verified: 0,
+      expected: recordIds.length,
+      missing: recordIds,
+      error: `Database verification error: ${error.message}`
+    };
+  }
+};
+
+/**
+ * Check AI connection status
+ * GET /api/test-data/ai-status
+ */
+const getAIStatus = asyncHandler(async (req, res) => {
+  const startTime = Date.now();
+  
+  try {
+    const status = await aiGenerationService.checkConnection();
+    const responseTime = Date.now() - startTime;
+    
+    res.status(200).json({
+      ...status,
+      responseTime,
+      checkedAt: new Date().toISOString(),
+      endpoint: `${process.env.OLLAMA_HOST || '192.168.8.21'}:${process.env.OLLAMA_PORT || '11434'}`,
+      targetModel: process.env.OLLAMA_MODEL || 'gpt-oss:20b'
+    });
+  } catch (error) {
+    const responseTime = Date.now() - startTime;
+    console.error('AI status check failed:', error);
+    
+    res.status(200).json({
+      connected: false,
+      modelAvailable: false,
+      error: error.message,
+      responseTime,
+      checkedAt: new Date().toISOString(),
+      endpoint: `${process.env.OLLAMA_HOST || '192.168.8.21'}:${process.env.OLLAMA_PORT || '11434'}`,
+      targetModel: process.env.OLLAMA_MODEL || 'gpt-oss:20b'
+    });
+  }
+});
+
+/**
+ * Generate test data using AI and automatically save to database
+ * POST /api/test-data/generate
+ */
+const generateTestData = asyncHandler(async (req, res) => {
+  const organizationId = req.user.organizationId;
+  const {
+    dataType,
+    quantity = 5,
+    severityDistribution = {
+      critical: 10,
+      high: 20,
+      medium: 30,
+      low: 25,
+      info: 15
+    },
+    scenario = 'mixed',
+    timeRange = 'last_24h',
+    preview = true,
+  } = req.body;
+
+  // Validate input
+  if (!['alert', 'incident', 'asset', 'ioc', 'playbook', 'threat_actor', 'threat_campaign'].includes(dataType)) {
+    throw new ValidationError('Invalid data type. Must be alert, incident, asset, ioc, playbook, threat_actor, or threat_campaign.');
+  }
+
+  if (quantity < 1 || quantity > 5) {
+    throw new ValidationError('Quantity must be between 1 and 5.');
+  }
+
+  const config = {
+    dataType,
+    quantity,
+    severityDistribution,
+    scenario,
+    timeRange,
+    organizationId,
+    userId: req.user.id,
+  };
+
+  let generatedData = [];
+  let createdRecords = [];
+  let createdIds = [];
+  let databaseVerification = null;
+
+  try {
+    // Step 1: Generate AI data
+    console.log(`🤖 Generating AI data for ${dataType}...`);
+    if (dataType === 'alert') {
+      generatedData = await aiGenerationService.generateTestAlerts(config);
+    } else if (dataType === 'incident') {
+      generatedData = await aiGenerationService.generateTestIncidents(config);
+    } else if (dataType === 'asset') {
+      generatedData = await aiGenerationService.generateTestAssets(config);
+    } else if (dataType === 'ioc') {
+      generatedData = await aiGenerationService.generateTestIOCs(config);
+    } else if (dataType === 'playbook') {
+      generatedData = await aiGenerationService.generateTestPlaybooks(config);
+    } else if (dataType === 'threat_actor') {
+      generatedData = await aiGenerationService.generateTestThreatActors(config);
+    } else if (dataType === 'threat_campaign') {
+      generatedData = await aiGenerationService.generateTestThreatCampaigns(config);
+    }
+
+    if (!generatedData || generatedData.length === 0) {
+      throw new Error('AI generation returned no data');
+    }
+
+    console.log(`✅ AI generated ${generatedData.length} ${dataType} records`);
+
+    // Step 2: Automatically save to database using existing creation functions
+    console.log(`💾 Saving generated ${dataType} data to database...`);
+    const dataToSave = { [dataType + 's']: generatedData };
+
+    if (dataType === 'alert') {
+      const createResponse = await createTestAlertsInternal(dataToSave, req.user, organizationId);
+      createdIds = createResponse.alertIds || [];
+    } else if (dataType === 'incident') {
+      const createResponse = await createTestIncidentsInternal(dataToSave, req.user, organizationId);
+      createdIds = createResponse.incidentIds || [];
+    } else if (dataType === 'asset') {
+      const createResponse = await createTestAssetsInternal(dataToSave, req.user, organizationId);
+      createdIds = createResponse.assetIds || [];
+    } else if (dataType === 'ioc') {
+      const createResponse = await createTestIOCsInternal(dataToSave, req.user, organizationId);
+      createdIds = createResponse.iocIds || [];
+    } else if (dataType === 'playbook') {
+      const createResponse = await createTestPlaybooksInternal(dataToSave, req.user, organizationId);
+      createdIds = createResponse.playbookIds || [];
+    } else if (dataType === 'threat_actor') {
+      const createResponse = await createTestThreatActorsInternal(dataToSave, req.user, organizationId);
+      createdIds = createResponse.threatActorIds || [];
+    } else if (dataType === 'threat_campaign') {
+      const createResponse = await createTestThreatCampaignsInternal(dataToSave, req.user, organizationId);
+      createdIds = createResponse.threatCampaignIds || [];
+    }
+
+    console.log(`💾 Database creation returned ${createdIds.length} IDs`);
+
+    // Step 3: Wait briefly to ensure database transactions are committed
+    console.log(`⏱️  Waiting for database transactions to commit...`);
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    // Step 4: Verify records actually exist in database
+    console.log(`🔍 Verifying records exist in database...`);
+    databaseVerification = await verifyDatabaseRecords(dataType, createdIds, organizationId);
+
+    console.log(`🔍 Database verification: ${databaseVerification.verified}/${databaseVerification.expected} records found`);
+
+    // Step 5: Determine success based on database verification
+    const overallSuccess = databaseVerification.success && createdIds.length === generatedData.length;
+
+    // Step 6: Log comprehensive end-to-end result
+    console.log(`📊 Logging end-to-end AI generation result...`);
+    const generationContext = aiGenerationService.getLastGenerationContext();
+    if (generationContext) {
+      const totalExecutionTime = (generationContext.aiExecutionTime || 0) + 
+                                 (Date.now() - new Date().getTime()); // Approximate total time
+      
+      await aiGenerationService.logAIGenerationResult({
+        ...generationContext,
+        databaseSuccess: overallSuccess,
+        databaseError: overallSuccess ? null : databaseVerification.error,
+        verificationDetails: databaseVerification,
+        totalExecutionTime: totalExecutionTime
+      });
+      
+      // Clear the stored context
+      aiGenerationService.clearGenerationContext();
+    }
+
+    // Step 7: Trigger automatic embedding for supported data types
+    console.log(`DEBUG: overallSuccess=${overallSuccess}, dataType=${dataType}`);
+    if (overallSuccess && ['alert', 'incident', 'asset', 'ioc', 'playbook'].includes(dataType)) {
+      console.log(`🔄 Triggering automatic embedding for ${databaseVerification.verified} ${dataType} records...`);
+      databaseVerification.existing.forEach(recordId => {
+        console.log(`  📋 Queuing embedding for ${dataType} ${recordId}`);
+        embeddingHelper.triggerEmbeddingForRecord(dataType, recordId, 'create');
+      });
+    } else {
+      console.log(`DEBUG: Skipping embedding - overallSuccess=${overallSuccess}, dataType supported=${['alert', 'incident', 'asset', 'ioc', 'playbook'].includes(dataType)}`);
+    }
+    
+    if (overallSuccess) {
+      // Success case
+      res.status(200).json({
+        success: true,
+        dataType,
+        aiGenerated: generatedData.length,
+        databaseSaved: databaseVerification.verified,
+        createdIds: databaseVerification.existing,
+        data: preview ? generatedData.slice(0, 5) : generatedData,
+        fullData: preview ? undefined : generatedData,
+        verification: {
+          databaseSuccess: true,
+          recordsCreated: databaseVerification.verified,
+          expectedRecords: generatedData.length,
+          verificationDetails: databaseVerification
+        }
+      });
+    } else {
+      // Failure case - AI generated but database save failed
+      const errorMessage = databaseVerification.error || 
+                          `Database save failed: Expected ${generatedData.length} records but only ${databaseVerification.verified} found in database`;
+      
+      console.error(`❌ Generation failed:`, errorMessage);
+      
+      res.status(500).json({
+        success: false,
+        error: errorMessage,
+        dataType,
+        aiGenerated: generatedData.length,
+        databaseSaved: databaseVerification.verified,
+        verification: {
+          databaseSuccess: false,
+          recordsCreated: databaseVerification.verified,
+          expectedRecords: generatedData.length,
+          verificationDetails: databaseVerification,
+          missingRecords: databaseVerification.missing
+        }
+      });
+    }
+
+  } catch (error) {
+    console.error(`❌ Test data generation and save failed for ${dataType}:`, error);
+    
+    // Log end-to-end result even for failures
+    console.log(`📊 Logging end-to-end AI generation failure...`);
+    const generationContext = aiGenerationService.getLastGenerationContext();
+    if (generationContext) {
+      const totalExecutionTime = (generationContext.aiExecutionTime || 0) + 
+                                 (Date.now() - new Date().getTime()); // Approximate total time
+      
+      await aiGenerationService.logAIGenerationResult({
+        ...generationContext,
+        databaseSuccess: false,
+        databaseError: error.message,
+        verificationDetails: databaseVerification,
+        totalExecutionTime: totalExecutionTime
+      });
+      
+      // Clear the stored context
+      aiGenerationService.clearGenerationContext();
+    }
+    
+    // Comprehensive error response
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      dataType,
+      aiGenerated: generatedData.length || 0,
+      databaseSaved: databaseVerification?.verified || 0,
+      stage: generatedData.length === 0 ? 'ai_generation' : 'database_save',
+      verification: databaseVerification ? {
+        databaseSuccess: false,
+        recordsCreated: databaseVerification.verified || 0,
+        expectedRecords: generatedData.length || 0,
+        verificationDetails: databaseVerification
+      } : null
+    });
+  }
+});
+
+/**
+ * Create test alerts in database
+ * POST /api/test-data/alerts
+ */
+const createTestAlerts = asyncHandler(async (req, res) => {
+  const organizationId = req.user.organizationId;
+  const { alerts } = req.body;
+
+  if (!Array.isArray(alerts) || alerts.length === 0) {
+    throw new ValidationError('Alerts array is required and cannot be empty.');
+  }
+
+  // Validate each alert
+  const validatedAlerts = alerts.map(alert => ({
+    ...alert,
+    organizationId,
+    isTestData: true,
+    eventTime: alert.eventTime || new Date(),
+    status: alert.status || 'new',
+    enrichmentData: {
+      ...alert.enrichmentData,
+      createdBy: `${req.user.firstName} ${req.user.lastName}`,
+      createdAt: new Date().toISOString(),
+    },
+  }));
+
+  try {
+    // Use the consistent createAlertHelper function instead of direct database insertion
+    // This ensures timeline events, notifications, and all other logic is properly executed
+    const createdAlerts = [];
+    
+    for (const alertData of validatedAlerts) {
+      try {
+        const createdAlert = await createAlertHelper(alertData, req.user);
+        createdAlerts.push(createdAlert);
+        console.log(`✅ Test alert created: ${createdAlert.title} (isTestData: ${createdAlert.isTestData})`);
+      } catch (error) {
+        console.error(`❌ Failed to create test alert: ${alertData.title}`, error);
+        throw error;
+      }
+    }
+    
+    // Log the test data creation activity
+    await logTestDataActivity(
+      req.user.id,
+      'test_alerts_created',
+      `Created ${createdAlerts.length} test alerts using consistent API logic`,
+      {
+        alertCount: createdAlerts.length,
+        scenario: alerts[0]?.enrichmentData?.scenario || 'unknown',
+      }
+    );
+
+    res.status(201).json({
+      success: true,
+      message: `Created ${createdAlerts.length} test alerts`,
+      alertIds: createdAlerts.map(alert => alert.id),
+    });
+  } catch (error) {
+    console.error('Failed to create test alerts:', error);
+    throw new ValidationError('Failed to create test alerts: ' + error.message);
+  }
+});
+
+/**
+ * Create test incidents in database
+ * POST /api/test-data/incidents
+ */
+const createTestIncidents = asyncHandler(async (req, res) => {
+  const organizationId = req.user.organizationId;
+  const { incidents } = req.body;
+
+  if (!Array.isArray(incidents) || incidents.length === 0) {
+    throw new ValidationError('Incidents array is required and cannot be empty.');
+  }
+
+  const validatedIncidents = incidents.map(incident => {
+    // For test incidents, remove fake alertIds completely since they don't reference real alerts
+    // This follows proper architecture - no UUID generation outside of database
+    let processedIncident = { ...incident };
+    
+    // Store original AI-generated alertIds in metadata for reference
+    const originalAlertIds = processedIncident.alertIds;
+    const originalAlertCount = Array.isArray(originalAlertIds) ? originalAlertIds.length : 0;
+    
+    // Remove fake alertIds - test incidents don't need to reference real alerts
+    delete processedIncident.alertIds;
+    processedIncident.alertCount = 0;
+    
+    console.log(`✅ Processed test incident: removed ${originalAlertCount} fake alertIds`);
+    
+    return {
+      ...processedIncident,
+      organizationId,
+      isTestData: true,
+      assignedTo: processedIncident.assignedTo || req.user.id,
+      assignedToName: processedIncident.assignedToName || `${req.user.firstName} ${req.user.lastName}`,
+      metadata: {
+        ...processedIncident.metadata,
+        createdBy: `${req.user.firstName} ${req.user.lastName}`,
+        createdAt: new Date().toISOString(),
+        testDataGenerated: true,
+        originalAlertIds: originalAlertIds, // Preserve original AI-generated values for reference
+        originalAlertCount: originalAlertCount
+      },
+    };
+  });
+
+  try {
+    const createdIncidents = await models.Incident.bulkCreate(validatedIncidents);
+    
+    // Trigger automatic embedding for created incidents
+    console.log(`🔄 Triggering embedding for ${createdIncidents.length} created incidents...`);
+    createdIncidents.forEach(incident => {
+      console.log(`  📋 Queuing embedding for incident ${incident.id}`);
+      embeddingHelper.triggerEmbeddingForRecord('incident', incident.id, 'create');
+    });
+    
+    // Create initial timeline events for each incident
+    const timelineEvents = createdIncidents.map(incident => ({
+      timestamp: new Date(),
+      type: 'action',
+      title: 'Test Incident Created',
+      description: `Test incident created by ${req.user.firstName} ${req.user.lastName} via Test Data Generator`,
+      userId: req.user.id,
+      userName: `${req.user.firstName} ${req.user.lastName}`,
+      incidentId: incident.id,
+      isTestData: true,
+    }));
+
+    await models.TimelineEvent.bulkCreate(timelineEvents);
+
+    await logTestDataActivity(
+      req.user.id,
+      'test_incidents_created',
+      `Created ${createdIncidents.length} test incidents`,
+      {
+        incidentCount: createdIncidents.length,
+        scenario: incidents[0]?.metadata?.scenario || 'unknown',
+      }
+    );
+
+    res.status(201).json({
+      success: true,
+      message: `Created ${createdIncidents.length} test incidents`,
+      incidentIds: createdIncidents.map(incident => incident.id),
+    });
+  } catch (error) {
+    console.error('Failed to create test incidents:', error);
+    throw new ValidationError('Failed to create test incidents: ' + error.message);
+  }
+});
+
+/**
+ * Get test data statistics
+ * GET /api/test-data/stats
+ */
+const getTestDataStats = asyncHandler(async (req, res) => {
+  const organizationId = req.user.organizationId;
+
+  try {
+    const [testAlerts, testIncidents, testAssets, testIOCs, testPlaybooks] = await Promise.all([
+      models.Alert.count({ 
+        where: { 
+          organizationId,
+          [Op.or]: [
+            { isTestData: true },
+            { sourceSystem: 'TestDataGenerator' }
+          ]
+        }
+      }),
+      models.Incident.count({ 
+        where: { 
+          organizationId, 
+          isTestData: true 
+        }
+      }),
+      models.Asset.count({ 
+        where: { 
+          organizationId, 
+          isTestData: true 
+        }
+      }),
+      models.IOC.count({ 
+        where: { 
+          organizationId, 
+          isTestData: true 
+        }
+      }),
+      models.Playbook.count({ 
+        where: { 
+          organizationId, 
+          isTestData: true 
+        }
+      }),
+    ]);
+
+  // Get test data by creation date (last 30 days)
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+  const [recentTestAlerts, recentTestIncidents, recentTestAssets, recentTestIOCs, recentTestPlaybooks] = await Promise.all([
+    models.Alert.count({
+      where: {
+        organizationId,
+        sourceSystem: 'TestDataGenerator',
+        createdAt: { [Op.gte]: thirtyDaysAgo },
+      },
+    }),
+    models.Incident.count({
+      where: {
+        organizationId,
+        isTestData: true,
+        createdAt: { [Op.gte]: thirtyDaysAgo },
+      },
+    }),
+    models.Asset.count({
+      where: {
+        organizationId,
+        isTestData: true,
+        createdAt: { [Op.gte]: thirtyDaysAgo },
+      },
+    }),
+    models.IOC.count({
+      where: {
+        organizationId,
+        isTestData: true,
+        createdAt: { [Op.gte]: thirtyDaysAgo },
+      },
+    }),
+    models.Playbook.count({
+      where: {
+        organizationId,
+        isTestData: true,
+        createdAt: { [Op.gte]: thirtyDaysAgo },
+      },
+    }),
+  ]);
+
+    res.status(200).json({
+      total: {
+        alerts: testAlerts,
+        incidents: testIncidents,
+        assets: testAssets,
+        iocs: testIOCs,
+        playbooks: testPlaybooks,
+      },
+      recent: {
+        alerts: recentTestAlerts,
+        incidents: recentTestIncidents,
+        assets: recentTestAssets,
+        iocs: recentTestIOCs,
+        playbooks: recentTestPlaybooks,
+      },
+      summary: {
+        totalTestDataRecords: testAlerts + testIncidents + testAssets + testIOCs + testPlaybooks,
+        recentTestDataRecords: recentTestAlerts + recentTestIncidents + recentTestAssets + recentTestIOCs + recentTestPlaybooks,
+      },
+    });
+  } catch (error) {
+    console.error('Error getting test data stats:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Failed to fetch test data statistics',
+      details: error.message
+    });
+  }
+});
+
+/**
+ * Clean up test data
+ * DELETE /api/test-data/cleanup
+ */
+const cleanupTestData = asyncHandler(async (req, res) => {
+  const organizationId = req.user.organizationId;
+  const { dataType, olderThan } = req.query;
+
+  let where = { organizationId };
+  
+  // Add test data filter
+  if (dataType === 'alert') {
+    where = {
+      ...where,
+      [Op.or]: [
+        { isTestData: true },
+        { sourceSystem: 'TestDataGenerator' }
+      ]
+    };
+  } else if (['incident', 'asset', 'ioc', 'playbook', 'threat_actor', 'threat_campaign'].includes(dataType)) {
+    where = { ...where, isTestData: true };
+  }
+
+  // Add time filter if specified
+  if (olderThan) {
+    const cutoffDate = new Date();
+    const days = parseInt(olderThan);
+    cutoffDate.setDate(cutoffDate.getDate() - days);
+    where.createdAt = { [Op.lt]: cutoffDate };
+  }
+
+  try {
+    let deletedCount = 0;
+
+    if (!dataType || dataType === 'alert') {
+      const alertWhere = dataType ? where : {
+        organizationId,
+        [Op.or]: [
+          { isTestData: true },
+          { sourceSystem: 'TestDataGenerator' }
+        ]
+      };
+      
+      if (olderThan && !dataType) {
+        const cutoffDate = new Date();
+        const days = parseInt(olderThan);
+        cutoffDate.setDate(cutoffDate.getDate() - days);
+        alertWhere.createdAt = { [Op.lt]: cutoffDate };
+      }
+
+      const deletedAlerts = await models.Alert.destroy({ where: alertWhere });
+      deletedCount += deletedAlerts;
+    }
+
+    if (!dataType || dataType === 'incident') {
+      const incidentWhere = dataType ? where : {
+        organizationId,
+        isTestData: true
+      };
+      
+      if (olderThan && !dataType) {
+        const cutoffDate = new Date();
+        const days = parseInt(olderThan);
+        cutoffDate.setDate(cutoffDate.getDate() - days);
+        incidentWhere.createdAt = { [Op.lt]: cutoffDate };
+      }
+
+      // Also delete related timeline events
+      await models.TimelineEvent.destroy({
+        where: {
+          isTestData: true,
+          ...(olderThan && {
+            timestamp: { [Op.lt]: new Date(Date.now() - parseInt(olderThan) * 24 * 60 * 60 * 1000) }
+          })
+        }
+      });
+
+      const deletedIncidents = await models.Incident.destroy({ where: incidentWhere });
+      deletedCount += deletedIncidents;
+    }
+
+    if (!dataType || dataType === 'asset') {
+      const assetWhere = dataType ? where : {
+        organizationId,
+        isTestData: true
+      };
+      
+      if (olderThan && !dataType) {
+        const cutoffDate = new Date();
+        const days = parseInt(olderThan);
+        cutoffDate.setDate(cutoffDate.getDate() - days);
+        assetWhere.createdAt = { [Op.lt]: cutoffDate };
+      }
+
+      const deletedAssets = await models.Asset.destroy({ where: assetWhere });
+      deletedCount += deletedAssets;
+    }
+
+    if (!dataType || dataType === 'ioc') {
+      const iocWhere = dataType ? where : {
+        organizationId,
+        isTestData: true
+      };
+      
+      if (olderThan && !dataType) {
+        const cutoffDate = new Date();
+        const days = parseInt(olderThan);
+        cutoffDate.setDate(cutoffDate.getDate() - days);
+        iocWhere.createdAt = { [Op.lt]: cutoffDate };
+      }
+
+      const deletedIOCs = await models.IOC.destroy({ where: iocWhere });
+      deletedCount += deletedIOCs;
+    }
+
+    if (!dataType || dataType === 'playbook') {
+      const playbookWhere = dataType ? where : {
+        organizationId,
+        isTestData: true
+      };
+      
+      if (olderThan && !dataType) {
+        const cutoffDate = new Date();
+        const days = parseInt(olderThan);
+        cutoffDate.setDate(cutoffDate.getDate() - days);
+        playbookWhere.createdAt = { [Op.lt]: cutoffDate };
+      }
+
+      const deletedPlaybooks = await models.Playbook.destroy({ where: playbookWhere });
+      deletedCount += deletedPlaybooks;
+    }
+
+    if (!dataType || dataType === 'threat_actor') {
+      const threatActorWhere = dataType ? where : {
+        organizationId,
+        isTestData: true
+      };
+      
+      if (olderThan && !dataType) {
+        const cutoffDate = new Date();
+        const days = parseInt(olderThan);
+        cutoffDate.setDate(cutoffDate.getDate() - days);
+        threatActorWhere.createdAt = { [Op.lt]: cutoffDate };
+      }
+
+      const deletedThreatActors = await models.ThreatActor.destroy({ where: threatActorWhere });
+      deletedCount += deletedThreatActors;
+    }
+
+    if (!dataType || dataType === 'threat_campaign') {
+      const threatCampaignWhere = dataType ? where : {
+        organizationId,
+        isTestData: true
+      };
+      
+      if (olderThan && !dataType) {
+        const cutoffDate = new Date();
+        const days = parseInt(olderThan);
+        cutoffDate.setDate(cutoffDate.getDate() - days);
+        threatCampaignWhere.createdAt = { [Op.lt]: cutoffDate };
+      }
+
+      const deletedThreatCampaigns = await models.ThreatCampaign.destroy({ where: threatCampaignWhere });
+      deletedCount += deletedThreatCampaigns;
+    }
+
+    await logTestDataActivity(
+      req.user.id,
+      'test_data_cleanup',
+      `Cleaned up ${deletedCount} test data items`,
+      {
+        deletedCount,
+        dataType: dataType || 'all',
+        olderThan: olderThan || 'all',
+      }
+    );
+
+    res.status(200).json({
+      success: true,
+      message: `Cleaned up ${deletedCount} test data items`,
+      deletedCount,
+    });
+  } catch (error) {
+    console.error('Cleanup failed:', error);
+    throw new ValidationError('Failed to cleanup test data: ' + error.message);
+  }
+});
+
+
+
+
+/**
+ * Generate random MAC address
+ */
+const generateMACAddress = () => {
+  const hexChars = '0123456789ABCDEF';
+  let mac = '';
+  for (let i = 0; i < 6; i++) {
+    if (i > 0) mac += ':';
+    mac += hexChars[Math.floor(Math.random() * 16)];
+    mac += hexChars[Math.floor(Math.random() * 16)];
+  }
+  return mac;
+};
+
+/**
+ * Log test data activities
+ */
+const logTestDataActivity = async (userId, action, description, metadata = {}) => {
+  try {
+    await sequelize.query(`
+      INSERT INTO settings_activities (id, user_id, action, description, metadata)
+      VALUES (gen_random_uuid(), :userId, :action, :description, :metadata)
+    `, {
+      replacements: {
+        userId,
+        action,
+        description,
+        metadata: JSON.stringify({
+          ...metadata,
+          component: 'test-data-generator',
+        })
+      }
+    });
+  } catch (error) {
+    console.error('Failed to log test data activity:', error);
+    // Don't throw - activity logging should not break main functionality
+  }
+};
+
+/**
+ * Create test assets in database
+ * POST /api/test-data/assets
+ */
+const createTestAssets = asyncHandler(async (req, res) => {
+  const organizationId = req.user.organizationId;
+  const { assets } = req.body;
+
+  console.log('🔧 DEBUG: createTestAssets called with:', { assetsCount: assets?.length, userId: req.user?.id });
+
+  if (!Array.isArray(assets) || assets.length === 0) {
+    throw new ValidationError('Assets array is required and cannot be empty.');
+  }
+
+  const createdAssets = [];
+  const errors = [];
+
+  // Process each asset individually using the helper (like createTestAssetsInternal does)
+  for (let i = 0; i < assets.length; i++) {
+    const assetData = assets[i];
+    try {
+      console.log('🔧 DEBUG: Processing asset:', assetData.name || `Asset ${i + 1}`);
+      
+      // Add metadata for tracking
+      const enrichedAssetData = {
+        ...assetData,
+        isTestData: true,
+        metadata: {
+          ...assetData.metadata,
+          createdBy: `${req.user.firstName} ${req.user.lastName}`,
+          createdAt: new Date().toISOString(),
+        },
+      };
+      
+      const createdAsset = await createAssetHelper(enrichedAssetData, req.user);
+      createdAssets.push(createdAsset);
+      console.log('🔧 DEBUG: Asset created successfully:', createdAsset.id);
+      
+    } catch (error) {
+      console.error('🔧 DEBUG: Failed to create asset:', assetData.name || `Asset ${i + 1}`, error.message);
+      errors.push(`Asset "${assetData.name || `Asset ${i + 1}`}": ${error.message}`);
+    }
+  }
+
+  try {
+    await logTestDataActivity(
+      req.user.id,
+      'test_assets_created',
+      `Created ${createdAssets.length} test assets` + (errors.length > 0 ? ` with ${errors.length} errors` : ''),
+      {
+        assetCount: createdAssets.length,
+        errorCount: errors.length,
+        errors: errors,
+        scenario: assets[0]?.metadata?.scenario || 'unknown',
+      }
+    );
+
+    if (createdAssets.length === 0) {
+      throw new ValidationError(`Failed to create any assets: ${errors.join('; ')}`);
+    }
+
+    const response = {
+      success: true,
+      message: `Created ${createdAssets.length} test assets` + (errors.length > 0 ? ` with ${errors.length} errors` : ''),
+      assetIds: createdAssets.map(asset => asset.id),
+    };
+
+    if (errors.length > 0) {
+      response.errors = errors;
+      response.partialSuccess = true;
+    }
+
+    res.status(201).json(response);
+
+  } catch (error) {
+    console.error('Failed to create test assets:', error);
+    throw new ValidationError('Failed to create test assets: ' + error.message);
+  }
+});
+
+/**
+ * Create test IOCs in database
+ * POST /api/test-data/iocs
+ */
+const createTestIOCs = asyncHandler(async (req, res) => {
+  const organizationId = req.user.organizationId;
+  const { iocs } = req.body;
+
+  if (!Array.isArray(iocs) || iocs.length === 0) {
+    throw new ValidationError('IOCs array is required and cannot be empty.');
+  }
+
+  const validatedIOCs = iocs.map(ioc => ({
+    ...ioc,
+    organizationId,
+    isTestData: true,
+    firstSeen: (ioc.firstSeen === null || ioc.firstSeen === undefined) ? null : ioc.firstSeen,
+    lastSeen: (ioc.lastSeen === null || ioc.lastSeen === undefined) ? null : ioc.lastSeen,
+  }));
+
+  try {
+    const createdIOCs = await models.IOC.bulkCreate(validatedIOCs);
+    
+    // Trigger automatic embedding for created IOCs
+    createdIOCs.forEach(ioc => {
+      embeddingHelper.triggerEmbeddingForRecord('ioc', ioc.id, 'create');
+    });
+    
+    await logTestDataActivity(
+      req.user.id,
+      'test_iocs_created',
+      `Created ${createdIOCs.length} test IOCs`,
+      {
+        iocCount: createdIOCs.length,
+        scenario: iocs[0]?.metadata?.scenario || 'unknown',
+      }
+    );
+
+    res.status(201).json({
+      success: true,
+      message: `Created ${createdIOCs.length} test IOCs`,
+      iocIds: createdIOCs.map(ioc => ioc.id),
+    });
+  } catch (error) {
+    console.error('Failed to create test IOCs:', error);
+    throw new ValidationError('Failed to create test IOCs: ' + error.message);
+  }
+});
+
+/**
+ * Create test playbooks in database
+ * POST /api/test-data/playbooks
+ */
+const createTestPlaybooks = asyncHandler(async (req, res) => {
+  const organizationId = req.user.organizationId;
+  const { playbooks } = req.body;
+
+  if (!Array.isArray(playbooks) || playbooks.length === 0) {
+    throw new ValidationError('Playbooks array is required and cannot be empty.');
+  }
+
+  const validatedPlaybooks = playbooks.map(playbook => ({
+    ...playbook,
+    organizationId,
+    isTestData: true,
+    createdBy: playbook.createdBy || req.user.id,
+  }));
+
+  try {
+    const createdPlaybooks = await models.Playbook.bulkCreate(validatedPlaybooks);
+    
+    // Trigger automatic embedding for created playbooks
+    createdPlaybooks.forEach(playbook => {
+      embeddingHelper.triggerEmbeddingForRecord('playbook', playbook.id, 'create');
+    });
+    
+    await logTestDataActivity(
+      req.user.id,
+      'test_playbooks_created',
+      `Created ${createdPlaybooks.length} test playbooks`,
+      {
+        playbookCount: createdPlaybooks.length,
+        scenario: playbooks[0]?.metadata?.scenario || 'unknown',
+      }
+    );
+
+    res.status(201).json({
+      success: true,
+      message: `Created ${createdPlaybooks.length} test playbooks`,
+      playbookIds: createdPlaybooks.map(playbook => playbook.id),
+    });
+  } catch (error) {
+    console.error('Failed to create test playbooks:', error);
+    throw new ValidationError('Failed to create test playbooks: ' + error.message);
+  }
+});
+
+/**
+ * Internal helper functions for generateTestData to call existing creation logic
+ * These functions extract the core creation logic without HTTP response handling
+ */
+
+
+
+/**
+ * Create test threat actors in database
+ * POST /api/test-data/threat-actors
+ */
+const createTestThreatActors = asyncHandler(async (req, res) => {
+  const organizationId = req.user.organizationId;
+  const { threat_actors } = req.body;
+
+  if (!Array.isArray(threat_actors) || threat_actors.length === 0) {
+    throw new ValidationError('Threat actors array is required and cannot be empty.');
+  }
+
+  const validatedThreatActors = threat_actors.map(actor => ({
+    ...actor,
+    organizationId,
+    isTestData: true,
+  }));
+
+  try {
+    const createdThreatActors = await models.ThreatActor.bulkCreate(validatedThreatActors);
+    
+    await logTestDataActivity(
+      req.user.id,
+      'test_threat_actors_created',
+      `Created ${createdThreatActors.length} test threat actors`,
+      {
+        threatActorCount: createdThreatActors.length,
+        scenario: threat_actors[0]?.metadata?.scenario || 'unknown',
+      }
+    );
+
+    res.status(201).json({
+      success: true,
+      message: `Created ${createdThreatActors.length} test threat actors`,
+      threatActorIds: createdThreatActors.map(actor => actor.id),
+    });
+  } catch (error) {
+    console.error('Failed to create test threat actors:', error);
+    throw new ValidationError('Failed to create test threat actors: ' + error.message);
+  }
+});
+
+/**
+ * Create test threat campaigns in database
+ * POST /api/test-data/threat-campaigns
+ */
+const createTestThreatCampaigns = asyncHandler(async (req, res) => {
+  const organizationId = req.user.organizationId;
+  const { threat_campaigns } = req.body;
+
+  if (!Array.isArray(threat_campaigns) || threat_campaigns.length === 0) {
+    throw new ValidationError('Threat campaigns array is required and cannot be empty.');
+  }
+
+  const validatedThreatCampaigns = threat_campaigns.map(campaign => ({
+    ...campaign,
+    organizationId,
+    isTestData: true,
+  }));
+
+  try {
+    const createdThreatCampaigns = await models.ThreatCampaign.bulkCreate(validatedThreatCampaigns);
+    
+    await logTestDataActivity(
+      req.user.id,
+      'test_threat_campaigns_created',
+      `Created ${createdThreatCampaigns.length} test threat campaigns`,
+      {
+        threatCampaignCount: createdThreatCampaigns.length,
+        scenario: threat_campaigns[0]?.metadata?.scenario || 'unknown',
+      }
+    );
+
+    res.status(201).json({
+      success: true,
+      message: `Created ${createdThreatCampaigns.length} test threat campaigns`,
+      threatCampaignIds: createdThreatCampaigns.map(campaign => campaign.id),
+    });
+  } catch (error) {
+    console.error('Failed to create test threat campaigns:', error);
+    throw new ValidationError('Failed to create test threat campaigns: ' + error.message);
+  }
+});
+
+// Internal functions called by generateTestData
+// These call the actual helper functions that have embedding triggers
+const createTestAlertsInternal = async (dataToSave, user, organizationId) => {
+  const alerts = dataToSave.alerts || [];
+  const createdAlerts = [];
+  
+  for (const alertData of alerts) {
+    const result = await createAlertHelper(alertData, user);
+    createdAlerts.push(result);
+  }
+  
+  return { alertIds: createdAlerts.map(alert => alert.id) };
+};
+
+const createTestIncidentsInternal = async (dataToSave, user, organizationId) => {
+  console.log('🔧 DEBUG: createTestIncidentsInternal called with:', { incidentsCount: dataToSave.incidents?.length, userId: user?.id });
+  const incidents = dataToSave.incidents || [];
+  const createdIncidents = [];
+  
+  for (const incidentData of incidents) {
+    console.log('🔧 DEBUG: Processing incident:', incidentData.title, 'with alertIds:', incidentData.alertIds);
+    const result = await createIncidentHelper(incidentData, user);
+    createdIncidents.push(result);
+    console.log('🔧 DEBUG: Incident processed:', result.id);
+  }
+  
+  const incidentIds = createdIncidents.map(incident => incident.id);
+  console.log('🔧 DEBUG: Returning incident IDs:', incidentIds);
+  return { incidentIds };
+};
+
+const createTestAssetsInternal = async (dataToSave, user, organizationId) => {
+  console.log('🔧 DEBUG: createTestAssetsInternal called with:', { assetsCount: dataToSave.assets?.length, userId: user?.id });
+  const assets = dataToSave.assets || [];
+  const createdAssets = [];
+  
+  console.log('🔧 DEBUG: About to process', assets.length, 'assets');
+  for (const assetData of assets) {
+    console.log('🔧 DEBUG: Processing asset:', assetData.name);
+    const result = await createAssetHelper(assetData, user);
+    createdAssets.push(result);
+    console.log('🔧 DEBUG: Asset processed:', result.id);
+  }
+  
+  const assetIds = createdAssets.map(asset => asset.id);
+  console.log('🔧 DEBUG: Returning asset IDs:', assetIds);
+  return { assetIds };
+};
+
+const createTestIOCsInternal = async (dataToSave, user, organizationId) => {
+  const iocs = dataToSave.iocs || [];
+  const createdIOCs = [];
+  
+  for (const iocData of iocs) {
+    const result = await createIOCHelper(iocData, user);
+    createdIOCs.push(result);
+  }
+  
+  return { iocIds: createdIOCs.map(ioc => ioc.id) };
+};
+
+const createTestPlaybooksInternal = async (dataToSave, user, organizationId) => {
+  const playbooks = dataToSave.playbooks || [];
+  const createdPlaybooks = [];
+  
+  for (const playbookData of playbooks) {
+    const result = await createPlaybookHelper(playbookData, user);
+    createdPlaybooks.push(result);
+  }
+  
+  return { playbookIds: createdPlaybooks.map(playbook => playbook.id) };
+};
+
+const createTestThreatActorsInternal = async (dataToSave, user, organizationId) => {
+  console.log('🔧 DEBUG: createTestThreatActorsInternal called with:', { threatActorsCount: dataToSave.threat_actors?.length, userId: user?.id });
+  const threat_actors = dataToSave.threat_actors || [];
+  
+  if (threat_actors.length === 0) {
+    console.log('🔧 DEBUG: No threat actors to create');
+    return { threatActorIds: [] };
+  }
+  
+  const threatActorIds = await createThreatActorBulkHelper(threat_actors, user, organizationId);
+  console.log('🔧 DEBUG: Returning threat actor IDs:', threatActorIds);
+  return { threatActorIds };
+};
+
+const createTestThreatCampaignsInternal = async (dataToSave, user, organizationId) => {
+  console.log('🔧 DEBUG: createTestThreatCampaignsInternal called with:', { threatCampaignsCount: dataToSave.threat_campaigns?.length, userId: user?.id });
+  const threat_campaigns = dataToSave.threat_campaigns || [];
+  
+  if (threat_campaigns.length === 0) {
+    console.log('🔧 DEBUG: No threat campaigns to create');
+    return { threatCampaignIds: [] };
+  }
+  
+  const threatCampaignIds = await createThreatCampaignBulkHelper(threat_campaigns, user, organizationId);
+  console.log('🔧 DEBUG: Returning threat campaign IDs:', threatCampaignIds);
+  return { threatCampaignIds };
+};
+
+module.exports = {
+  getAIStatus,
+  generateTestData,
+  createTestAlerts,
+  createTestIncidents,
+  createTestAssets,
+  createTestIOCs,
+  createTestPlaybooks,
+  createTestThreatActors,
+  createTestThreatCampaigns,
+  getTestDataStats,
+  cleanupTestData,
+};

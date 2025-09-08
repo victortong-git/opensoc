@@ -1,0 +1,101 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+postgres_data/
+redis_data/
+test-results/
+test_files/
+*.pid
+*.png
+e2e_tests/playwright-report/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS generated files
+Thumbs.db
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Dependencies
+node_modules/
+jspm_packages/
+
+# Build outputs
+build/
+dist/
+out/
+
+# Coverage directory used by tools like istanbul
+coverage/
+*.lcov
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Optional npm cache directory
+.npm
+
+# Optional eslint cache
+.eslintcache
+
+.tgz
+.zip
+.7z
+
+aiqtoolkit/
+nvidia-nat/
+my-agents/open_code_review/
+
+CLAUDE.md
+.claude/
+
+attack-stix-data/
+
+.hf_cache/
+
+tmp/
+
+
+e2e_login_test.sh
+e2e_long_test.sh
+coding_practice.md
+
+CLAUDE.md
+mock-design/
+
+docs/
+backup_files/
+.claude/
+
+e2e_test/

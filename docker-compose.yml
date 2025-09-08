@@ -1,0 +1,176 @@
+
+services:
+  # PostgreSQL with pgvector extension
+  db:
+    image: pgvector/pgvector:pg17
+    container_name: agentic-soc-db
+    environment:
+      POSTGRES_DB: agentic_soc
+      POSTGRES_USER: agentic
+      POSTGRES_PASSWORD: secure_password_123
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+      - ./backend/database/init:/docker-entrypoint-initdb.d
+    networks:
+      agentic-network:
+        ipv4_address: 172.21.0.10
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentic -d agentic_soc"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+
+  # Backend API Server
+  backend:
+    build: 
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: agentic-soc-backend
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=development
+      - DATABASE_URL=postgresql://agentic:secure_password_123@172.21.0.10:5432/agentic_soc
+      - JWT_SECRET=your_jwt_secret_key_here_change_in_production
+      - JWT_EXPIRES_IN=7d
+      - PORT=3001
+      - CORS_ORIGIN=http://localhost:3000
+      - RATE_LIMIT_WINDOW_MS=900000
+      - RATE_LIMIT_MAX_REQUESTS=1000
+      - BCRYPT_ROUNDS=12
+      - HF_HOME=/app/.cache/huggingface
+      - TRANSFORMERS_CACHE=/app/.cache/huggingface
+      - HUGGINGFACE_HUB_CACHE=/app/.cache/huggingface
+    volumes:
+      - ./backend:/app
+      - ./attack-stix-data:/app/attack-stix-data:ro
+      - ./.hf_cache:/app/.cache/huggingface
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /app/node_modules
+    networks:
+      agentic-network:
+        ipv4_address: 172.21.0.20
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Frontend React Application
+  frontend:
+    build: 
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: agentic-soc-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_URL=http://localhost:3001/api
+      - VITE_WS_URL=http://localhost:3001
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      agentic-network:
+        ipv4_address: 172.21.0.30
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+
+
+  # NVIDIA NAT Server (API Mode)
+  nvidia-nat:
+    build:
+      context: .
+      dockerfile: ./Dockerfile-nemo_agent_toolkit
+    container_name: agentic-soc-nvidia-nat
+    ports:
+      - "8000:8000"
+    environment:
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
+      - PYTHONDONTWRITEBYTECODE=1
+      - PATH=/workspace/.venv/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+      - PYTHONPATH=/workspace:/workspace/src
+      - OLLAMA_HOST=${OLLAMA_HOST:-}
+      - OLLAMA_PORT=${OLLAMA_PORT:-}
+      - OLLAMA_URL=${OLLAMA_URL:-}
+      - VIRUSTOTAL_API_KEY=${VIRUSTOTAL_API_KEY:-}
+      - THREATFOX_API_KEY=${THREATFOX_API_KEY:-}
+      - LLM_BASE_URL=${LLM_BASE_URL:-}
+    volumes:
+      - ./logs:/workspace/logs
+      - ./my-agents:/workspace/my-agents
+      - ./ollama_provider:/workspace/ollama_provider
+      - ./.hf_cache:/workspace/.hf_cache
+    networks:
+      agentic-network:
+        ipv4_address: 172.21.0.60
+    working_dir: /workspace
+    tty: true
+    stdin_open: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request, json; urllib.request.urlopen(urllib.request.Request('http://localhost:8000/generate', data=json.dumps({'input_message':'health'}).encode(), headers={'Content-Type':'application/json'}))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # NVIDIA NAT MCP Server 
+  nvidia-nat-mcp:
+    build:
+      context: .
+      dockerfile: ./Dockerfile-nemo_agent_toolkit
+    container_name: agentic-soc-nvidia-nat-mcp
+    ports:
+      - "9901:9901"
+    environment:
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
+      - PYTHONDONTWRITEBYTECODE=1
+      - PATH=/workspace/.venv/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+      - PYTHONPATH=/workspace:/workspace/src
+      - OLLAMA_HOST=${OLLAMA_HOST:-}
+      - OLLAMA_PORT=${OLLAMA_PORT:-}
+      - OLLAMA_URL=${OLLAMA_URL:-}
+      - VIRUSTOTAL_API_KEY=${VIRUSTOTAL_API_KEY:-}
+      - THREATFOX_API_KEY=${THREATFOX_API_KEY:-}
+      - LLM_BASE_URL=${LLM_BASE_URL:-}
+      - MCP_SERVER_NAME=OpenSOC NAT MCP Server
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=9901
+    volumes:
+      - ./logs:/workspace/logs
+      - ./my-agents:/workspace/my-agents
+      - ./ollama_provider:/workspace/ollama_provider
+      - ./.hf_cache:/workspace/.hf_cache
+    networks:
+      agentic-network:
+        ipv4_address: 172.21.0.61
+    working_dir: /workspace
+    tty: true
+    stdin_open: true
+    restart: unless-stopped
+    command: ["nat", "mcp", "--config_file", "my-agents/open-soc/src/open_soc/configs/config.yml", "--host", "0.0.0.0", "--port", "9901", "--name", "OpenSOC NAT MCP Server"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9901/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+
+
+networks:
+  agentic-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16

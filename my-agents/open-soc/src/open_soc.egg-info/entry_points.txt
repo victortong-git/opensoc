@@ -1,0 +1,2 @@
+[aiq.components]
+open_soc = open_soc.register

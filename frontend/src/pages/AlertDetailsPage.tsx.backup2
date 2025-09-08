@@ -1,0 +1,898 @@
+import React, { useState, useEffect } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
+import { 
+  FileText, 
+  Bot, 
+  AlertCircle, 
+  Eye, 
+  Star, 
+  Loader2, 
+  Zap, 
+  AlertTriangle, 
+  Play
+} from 'lucide-react';
+import { Alert, AlertTimelineEvent } from '../types';
+import { formatDistanceToNow, parseISO } from 'date-fns';
+import alertService, { AlertAIAnalysis, AIClassificationResult, AIAnalysisResult, MitreAnalysisResponse } from '../services/alertService';
+import ToastService from '../services/toastService';
+import IncidentCreateModal from '../components/incidents/IncidentCreateModal';
+import IncidentVerificationSimple from '../components/alerts/IncidentVerificationSimple';
+import EventTagsComponent from '../components/alerts/EventTagsComponent';
+import AlertPlaybookGenerator from '../components/alerts/AlertPlaybookGenerator';
+import MitreAlertAnalysis from '../components/mitre/MitreAlertAnalysis';
+import OneClickAnalysisModal from '../components/alerts/OneClickAnalysisModal';
+import AnalysisErrorBoundary from '../components/alerts/analysis/AnalysisErrorBoundary';
+import AlertHeaderAndInfo from '../components/alerts/AlertHeaderAndInfo';
+import AIAnalysisDisplay from '../components/alerts/AIAnalysisDisplay';
+import AlertSidebarActions from '../components/alerts/AlertSidebarActions';
+import { useDispatch } from 'react-redux';
+import { AppDispatch } from '../store';
+import { fetchAlert } from '../store/alertsAsync';
+import { getSecurityEventTypeInfo } from '../utils/securityEventTypes';
+import type { EventTag } from '../types';
+import { useAlertData } from '../hooks/useAlertData';
+import { useAIAnalysisHandlers } from '../hooks/useAIAnalysisHandlers';
+import { useAlertFormManagement } from '../hooks/useAlertFormManagement';
+
+const AlertDetailsPage: React.FC = () => {
+  const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
+  const dispatch = useDispatch<AppDispatch>();
+  
+  // Use custom hook for data loading and state management
+  const {
+    alert,
+    loading,
+    error,
+    timeline,
+    timelineLoading,
+    aiAnalysis,
+    aiClassification,
+    mitreAnalysis,
+    relatedIncidents,
+    loadAlertDetails,
+    loadTimeline,
+    loadRelatedIncidents,
+    refreshAlertData,
+    setAlert
+  } = useAlertData(id);
+  
+  // Use custom hook for AI analysis handlers
+  const {
+    aiLoading,
+    aiError,
+    aiProgress,
+    aiClassificationLoading,
+    aiClassificationError,
+    mitreAnalysisLoading,
+    mitreAnalysisError,
+    immediatePlaybookLoading,
+    investigationPlaybookLoading,
+    playbookError,
+    playbookRefreshTrigger,
+    handleAnalyzeAlert,
+    handleAIClassification,
+    handleMitreAnalysis,
+    handleGenerateImmediatePlaybook,
+    handleGenerateInvestigationPlaybook,
+    handleTagsUpdate,
+    setAiAnalysis,
+    setAiClassification,
+    setMitreAnalysis,
+    setAlert: setAlertFromAI,
+    setPlaybookRefreshTrigger
+  } = useAIAnalysisHandlers(alert, { loadAlertDetails, loadTimeline }, { setParentAlert: setAlert });
+  
+  // Use custom hook for alert form management
+  const {
+    isEditing,
+    updating,
+    showResolveModal,
+    incidentCreationSuccess,
+    editFormData,
+    resolveFormData,
+    handleStatusChange,
+    handleIncidentCreated,
+    handleResolveSubmit,
+    handleEditToggle,
+    handleEditSave,
+    setEditFormData,
+    setResolveFormData,
+    setShowResolveModal,
+    setIncidentCreationSuccess,
+    getSeverityColor,
+    getStatusColor
+  } = useAlertFormManagement(alert, id, { setAlert, loadTimeline, loadRelatedIncidents });
+  
+  // UI state
+  const [showIncidentModal, setShowIncidentModal] = useState(false);
+  const [showOneClickAnalysisModal, setShowOneClickAnalysisModal] = useState(false);
+
+  // Safe date parsing helper
+  const safeParseDate = (dateValue: string | Date): Date => {
+    if (!dateValue) return new Date();
+    if (dateValue instanceof Date) return dateValue;
+    if (typeof dateValue === 'string') {
+      try {
+        return parseISO(dateValue);
+      } catch {
+        return new Date(dateValue);
+      }
+    }
+    return new Date();
+  };
+
+  // Safe date formatting helper
+  const safeFormatDistance = (dateValue: string | Date): string => {
+    try {
+      const parsedDate = safeParseDate(dateValue);
+      if (isNaN(parsedDate.getTime())) return 'Unknown';
+      return formatDistanceToNow(parsedDate, { addSuffix: true });
+    } catch {
+      return 'Unknown';
+    }
+  };
+
+
+
+
+  const handleOneClickAnalysisComplete = async (updatedAlert: Alert) => {
+    console.log('✅ One Click Analysis completed, updating alert state');
+    setAlert(updatedAlert);
+    // Keep modal open to show completion summary and time saved analysis
+    // setShowOneClickAnalysisModal(false); // Removed - let user close manually after reviewing results
+    
+    // Update individual analysis states if they were updated
+    if (updatedAlert.aiAnalysis) {
+      setAiAnalysis(updatedAlert.aiAnalysis);
+    }
+    if (updatedAlert.aiClassification) {
+      setAiClassification(updatedAlert.aiClassification);
+    }
+    if (updatedAlert.mitreAnalysis) {
+      setMitreAnalysis(updatedAlert.mitreAnalysis);
+    }
+    
+    // Refresh timeline to show all new analysis events (critical fix!)
+    await loadTimeline(updatedAlert.id);
+    
+    // Refresh the alert data from Redux store
+    if (id) {
+      dispatch(fetchAlert(id));
+    }
+  };
+
+
+  const getTimelineEventIcon = (type: string) => {
+    switch (type) {
+      case 'alert_created':
+        return { icon: AlertTriangle, color: 'bg-blue-500' };
+      case 'ai_analysis_completed':
+        return { icon: Bot, color: 'bg-green-500' };
+      case 'ai_auto_resolved':
+        return { icon: Bot, color: 'bg-purple-500' };
+      case 'status_change':
+        return { icon: CheckCircle, color: 'bg-yellow-500' };
+      case 'user_action':
+        return { icon: User, color: 'bg-orange-500' };
+      case 'note':
+        return { icon: FileText, color: 'bg-slate-500' };
+      default:
+        return { icon: Clock, color: 'bg-gray-500' };
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="space-y-6">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-3xl font-bold text-white">Loading Alert...</h1>
+          </div>
+          <button
+            onClick={() => navigate('/alerts')}
+            className="btn-secondary flex items-center space-x-2"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            <span>Back to Alerts</span>
+          </button>
+        </div>
+        
+        <div className="card p-12 text-center">
+          <div className="loading-spinner mx-auto mb-4"></div>
+          <p className="text-slate-400">Loading alert details...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error || !alert) {
+    return (
+      <div className="space-y-6">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-3xl font-bold text-white">Alert Not Found</h1>
+          </div>
+          <button
+            onClick={() => navigate('/alerts')}
+            className="btn-secondary flex items-center space-x-2"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            <span>Back to Alerts</span>
+          </button>
+        </div>
+        
+        <div className="card p-12 text-center">
+          <AlertTriangle className="h-12 w-12 text-red-400 mx-auto mb-4" />
+          <h3 className="text-lg font-medium text-white mb-2">Alert Not Found</h3>
+          <p className="text-slate-400">{error || 'The requested alert could not be found.'}</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Alert Header and Basic Information */}
+      <AlertHeaderAndInfo
+        alert={alert}
+        isEditing={isEditing}
+        updating={updating}
+        editFormData={editFormData}
+        setEditFormData={setEditFormData}
+        handleStatusChange={handleStatusChange}
+        handleEditSave={handleEditSave}
+        handleEditToggle={handleEditToggle}
+        getSeverityColor={getSeverityColor}
+        getStatusColor={getStatusColor}
+        safeParseDate={safeParseDate}
+        safeFormatDistance={safeFormatDistance}
+        incidentCreationSuccess={incidentCreationSuccess}
+      />
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Main Content */}
+        <div className="lg:col-span-2 space-y-6">
+
+          {/* AI Analysis Display Component */}
+          <AIAnalysisDisplay
+            alert={alert}
+            aiAnalysis={aiAnalysis}
+            aiClassification={aiClassification}
+            aiLoading={aiLoading}
+            aiError={aiError}
+            aiProgress={aiProgress}
+            setAiError={setAiError}
+          />
+
+          {/* Incident Verification Section */}
+          <div>
+            <IncidentVerificationSimple 
+              alert={alert} 
+              onUpdate={() => loadAlertDetails(alert.id)}
+            />
+          </div>
+
+          {/* Event Tags Section */}
+          <div>
+            <EventTagsComponent
+              tags={alert.eventTags || []}
+              confidence={alert.tagsConfidence}
+              generatedAt={alert.tagsGeneratedAt}
+              isEditable={true}
+              onTagsUpdate={handleTagsUpdate}
+              loading={aiClassificationLoading}
+            />
+          </div>
+
+          {/* Enhanced Related Incidents */}
+          {relatedIncidents.length > 0 && (
+            <div>
+              <div className="p-6 border-b border-soc-dark-700">
+                <h3 className="text-lg font-semibold text-white flex items-center space-x-2">
+                  <FileText className="h-5 w-5 text-opensoc-400" />
+                  <span>Related Incidents ({relatedIncidents.length})</span>
+                </h3>
+              </div>
+              
+              <div className="bg-soc-dark-800/50 border border-soc-dark-700 rounded-lg p-4 space-y-3">
+                {relatedIncidents.map((incident: any) => (
+                  <div
+                    key={incident.id}
+                    className="bg-soc-dark-800 border border-soc-dark-700 rounded-lg p-4 hover:bg-soc-dark-750 transition-colors cursor-pointer"
+                    onClick={() => navigate(`/incidents/${incident.id}`)}
+                  >
+                    <div className="flex items-start justify-between">
+                      <div className="flex-1">
+                        <div className="flex items-center space-x-3">
+                          <h4 className="font-medium text-white hover:text-opensoc-400">
+                            {incident.title}
+                          </h4>
+                          <span className={`text-xs px-2 py-1 rounded border ${getSeverityColor(incident.severity)}`}>
+                            Severity {incident.severity}
+                          </span>
+                          <span className="text-xs text-slate-400 bg-slate-500/10 border border-slate-500/30 px-2 py-1 rounded">
+                            {incident.status?.toUpperCase()}
+                          </span>
+                        </div>
+                        
+                        {incident.description && (
+                          <p className="text-sm text-slate-400 mt-2 line-clamp-2">
+                            {incident.description}
+                          </p>
+                        )}
+                        
+                        <div className="flex items-center space-x-4 mt-2 text-xs text-slate-500">
+                          <span>{incident.assignedToName || 'Unassigned'}</span>
+                          <span>{safeFormatDistance(incident.createdAt)}</span>
+                        </div>
+                      </div>
+                      
+                      <ExternalLink className="h-4 w-4 text-slate-400 flex-shrink-0 ml-2" />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Resolve Remarks Section */}
+          {alert && alert.resolveRemarks && (
+            <div>
+              <h3 className="text-lg font-medium text-white mb-3">Resolution Details</h3>
+              <div className="bg-soc-dark-800/50 border border-soc-dark-700 rounded-lg p-4 space-y-4">
+                {/* Resolution Header */}
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center space-x-3">
+                    <div className="flex items-center space-x-2">
+                      {alert.resolveRemarks.autoResolved ? (
+                        <Bot className="h-4 w-4 text-opensoc-400" />
+                      ) : (
+                        <User className="h-4 w-4 text-blue-400" />
+                      )}
+                      <span className="font-medium text-white">
+                        {alert.resolveRemarks.autoResolved ? 'AI Auto-Resolved' : 'Manual Resolution'}
+                      </span>
+                    </div>
+                    <span className={`text-xs px-2 py-1 rounded border ${getStatusColor(alert.status)}`}>
+                      {alert.resolveRemarks.resolutionType?.toUpperCase().replace('_', ' ')}
+                    </span>
+                  </div>
+                  <span className="text-xs text-slate-400">
+                    {alert.resolveRemarks.resolvedAt ? safeFormatDistance(alert.resolveRemarks.resolvedAt) : 'Recently'}
+                  </span>
+                </div>
+
+                {/* Auto-resolution info */}
+                {alert.resolveRemarks.autoResolved && alert.resolveRemarks.aiConfidence && (
+                  <div className="bg-opensoc-500/10 border border-opensoc-500/30 rounded-lg p-3">
+                    <div className="flex items-center space-x-2 mb-2">
+                      <Zap className="h-4 w-4 text-opensoc-400" />
+                      <span className="text-sm font-medium text-opensoc-300">AI Confidence</span>
+                      <span className="text-xs bg-opensoc-500/20 text-opensoc-300 px-2 py-1 rounded">
+                        {alert.resolveRemarks.aiConfidence}%
+                      </span>
+                    </div>
+                    <p className="text-sm text-slate-300">
+                      This alert was automatically resolved by AI analysis with high confidence.
+                    </p>
+                  </div>
+                )}
+
+                {/* Resolution remarks */}
+                {alert.resolveRemarks.remarks && (
+                  <div>
+                    <h4 className="text-sm font-medium text-slate-300 mb-2">Resolution Remarks</h4>
+                    <div className="bg-soc-dark-900 border border-soc-dark-700 rounded-lg p-3">
+                      <p className="text-sm text-slate-300 whitespace-pre-wrap">
+                        {alert.resolveRemarks.remarks}
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* Additional reasoning */}
+                {alert.resolveRemarks.reasoning && (
+                  <div>
+                    <h4 className="text-sm font-medium text-slate-300 mb-2">Additional Reasoning</h4>
+                    <div className="bg-soc-dark-900 border border-soc-dark-700 rounded-lg p-3">
+                      <p className="text-sm text-slate-300 whitespace-pre-wrap">
+                        {alert.resolveRemarks.reasoning}
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* Resolver info */}
+                {alert.resolveRemarks.userName && (
+                  <div className="text-xs text-slate-500 pt-2 border-t border-soc-dark-700">
+                    Resolved by {alert.resolveRemarks.userName} 
+                    {alert.resolveRemarks.userEmail && ` (${alert.resolveRemarks.userEmail})`}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Raw Event Data */}
+          <div>
+            <h3 className="text-lg font-medium text-white mb-3">Raw Event Data</h3>
+            <div className="bg-soc-dark-950 border border-soc-dark-700 rounded-lg p-4">
+              <pre className="text-xs font-mono text-slate-300 overflow-x-auto whitespace-pre-wrap">
+                {JSON.stringify(alert.rawData, null, 2)}
+              </pre>
+            </div>
+          </div>
+        </div>
+
+        {/* Enhanced Sidebar */}
+        <div className="space-y-6">
+          {/* Actions */}
+          <AlertSidebarActions
+            alert={alert}
+            isEditing={isEditing}
+            updating={updating}
+            handleEditToggle={handleEditToggle}
+            handleEditSave={handleEditSave}
+            setShowIncidentModal={setShowIncidentModal}
+            setShowOneClickAnalysisModal={setShowOneClickAnalysisModal}
+            handleAIClassification={handleAIClassification}
+            handleAnalyzeAlert={handleAnalyzeAlert}
+            handleMitreAnalysis={handleMitreAnalysis}
+            handleGenerateImmediatePlaybook={handleGenerateImmediatePlaybook}
+            handleGenerateInvestigationPlaybook={handleGenerateInvestigationPlaybook}
+            aiClassificationLoading={aiClassificationLoading}
+            aiClassificationError={aiClassificationError}
+            setAiClassificationError={setAiClassificationError}
+            aiLoading={aiLoading}
+            aiError={aiError}
+            setAiError={setAiError}
+            mitreAnalysisLoading={mitreAnalysisLoading}
+            mitreAnalysisError={mitreAnalysisError}
+            setMitreAnalysisError={setMitreAnalysisError}
+            immediatePlaybookLoading={immediatePlaybookLoading}
+            investigationPlaybookLoading={investigationPlaybookLoading}
+            playbookError={playbookError}
+            setPlaybookError={setPlaybookError}
+          />
+            <h3 className="text-lg font-medium text-white mb-4">Actions</h3>
+            <div className="space-y-3">
+              {!isEditing ? (
+                <button 
+                  onClick={handleEditToggle}
+                  className="btn-secondary w-full flex items-center justify-center space-x-2"
+                >
+                  <Eye className="h-4 w-4" />
+                  <span>Edit Alert</span>
+                </button>
+              ) : (
+                <div className="bg-soc-dark-900/50 border border-opensoc-500/20 rounded-lg p-3">
+                  <p className="text-opensoc-400 text-sm text-center mb-2">Edit Mode Active</p>
+                  <div className="flex space-x-2">
+                    <button
+                      onClick={handleEditSave}
+                      disabled={updating}
+                      className="btn-primary flex-1 text-sm py-2 disabled:opacity-50"
+                    >
+                      {updating ? 'Saving...' : 'Save'}
+                    </button>
+                    <button
+                      onClick={handleEditToggle}
+                      className="btn-secondary flex-1 text-sm py-2"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+              
+              <button 
+                onClick={() => setShowIncidentModal(true)}
+                disabled={isEditing}
+                className="btn-primary w-full flex items-center justify-center space-x-2 disabled:opacity-50"
+              >
+                <FileText className="h-4 w-4" />
+                <span>Create Incident</span>
+              </button>
+
+              {/* One Click Analysis Button */}
+              <button 
+                onClick={() => setShowOneClickAnalysisModal(true)}
+                disabled={isEditing || aiClassificationLoading || aiLoading || mitreAnalysisLoading}
+                className="w-full bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 disabled:from-slate-800 disabled:to-slate-900 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg font-medium transition-all duration-200 flex items-center justify-center space-x-2"
+                title="Run comprehensive AI analysis - Classification, Alert Analysis, and MITRE ATT&CK in sequence"
+              >
+                <Play className="h-4 w-4" />
+                <span>One Click Analysis</span>
+              </button>
+
+              {/* Divider */}
+              <div className="border-t border-soc-dark-700 my-2"></div>
+
+              {/* AI Classification Button */}
+              <button 
+                onClick={handleAIClassification}
+                disabled={isEditing || aiClassificationLoading}
+                className="w-full bg-gradient-to-r from-purple-600 to-purple-700 hover:from-purple-700 hover:to-purple-800 disabled:from-purple-800 disabled:to-purple-900 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg font-medium transition-all duration-200 flex items-center justify-center space-x-2"
+                title="Generate AI-powered contextual tags and security event classification"
+              >
+                {aiClassificationLoading ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    <span>Classifying...</span>
+                  </>
+                ) : (
+                  <>
+                    <Bot className="h-4 w-4" />
+                    <span>AI Classification</span>
+                  </>
+                )}
+              </button>
+
+              {/* AI Classification Error */}
+              {aiClassificationError && (
+                <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-3">
+                  <div className="flex items-start space-x-2">
+                    <AlertCircle className="h-4 w-4 text-red-400 mt-0.5 flex-shrink-0" />
+                    <div>
+                      <p className="text-sm text-red-300 font-medium">Classification Failed</p>
+                      <p className="text-xs text-red-400 mt-1">{aiClassificationError}</p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => setAiClassificationError(null)}
+                    className="mt-2 text-xs text-red-400 hover:text-red-300 underline"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
+
+              {/* AI Alert Analysis Button */}
+              <button 
+                onClick={handleAnalyzeAlert}
+                disabled={isEditing || aiLoading}
+                className="w-full bg-gradient-to-r from-indigo-600 to-indigo-700 hover:from-indigo-700 hover:to-indigo-800 disabled:from-indigo-800 disabled:to-indigo-900 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg font-medium transition-all duration-200 flex items-center justify-center space-x-2"
+                title="Generate comprehensive AI-powered analysis and insights for this alert"
+              >
+                {aiLoading ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    <span>Analyzing Alert...</span>
+                  </>
+                ) : (
+                  <>
+                    <Zap className="h-4 w-4" />
+                    <span>AI Alert Analysis</span>
+                  </>
+                )}
+              </button>
+
+              {/* AI Alert Analysis Error */}
+              {aiError && (
+                <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-3">
+                  <div className="flex items-start space-x-2">
+                    <AlertCircle className="h-4 w-4 text-red-400 mt-0.5 flex-shrink-0" />
+                    <div>
+                      <p className="text-sm text-red-300 font-medium">AI Analysis Failed</p>
+                      <p className="text-xs text-red-400 mt-1">{aiError}</p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => setAiError(null)}
+                    className="mt-2 text-xs text-red-400 hover:text-red-300 underline"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
+
+              {/* MITRE ATT&CK Analysis Button */}
+              <button 
+                onClick={handleMitreAnalysis}
+                disabled={isEditing || mitreAnalysisLoading}
+                className="w-full bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 disabled:from-blue-800 disabled:to-blue-900 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg font-medium transition-all duration-200 flex items-center justify-center space-x-2"
+                title="Analyze alert using multi-domain MITRE ATT&CK framework (Enterprise, Mobile, ICS) with AI enrichment"
+              >
+                {mitreAnalysisLoading ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    <span>Analyzing MITRE ATT&CK...</span>
+                  </>
+                ) : (
+                  <>
+                    <Shield className="h-4 w-4" />
+                    <span>MITRE ATT&CK Analysis</span>
+                  </>
+                )}
+              </button>
+
+              {/* MITRE Analysis Error */}
+              {mitreAnalysisError && (
+                <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-3">
+                  <div className="flex items-start space-x-2">
+                    <AlertCircle className="h-4 w-4 text-red-400 mt-0.5 flex-shrink-0" />
+                    <div>
+                      <p className="text-sm text-red-300 font-medium">MITRE Analysis Failed</p>
+                      <p className="text-xs text-red-400 mt-1">{mitreAnalysisError}</p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => setMitreAnalysisError(null)}
+                    className="mt-2 text-xs text-red-400 hover:text-red-300 underline"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
+
+              {/* AI Analysis Requirement Warning */}
+              {!alert?.aiAnalysis && (
+                <div className="bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-3 mb-3">
+                  <div className="flex items-start space-x-2">
+                    <AlertCircle className="h-4 w-4 text-yellow-400 mt-0.5 flex-shrink-0" />
+                    <div>
+                      <p className="text-sm text-yellow-300 font-medium">AI Analysis Required</p>
+                      <p className="text-xs text-yellow-400 mt-1">
+                        Run "AI Alert Analysis" first to enable playbook generation. Playbooks use AI analysis as context input.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Generate Immediate Playbook Button */}
+              <button 
+                onClick={handleGenerateImmediatePlaybook}
+                disabled={isEditing || immediatePlaybookLoading || !alert?.aiAnalysis}
+                className={`w-full px-4 py-2 rounded-lg font-medium transition-all duration-200 flex items-center justify-center space-x-2 ${
+                  isEditing || immediatePlaybookLoading || !alert?.aiAnalysis 
+                    ? 'bg-slate-600 text-slate-400 cursor-not-allowed opacity-60 border border-slate-500' 
+                    : 'bg-gradient-to-r from-red-600 to-red-700 hover:from-red-700 hover:to-red-800 text-white'
+                }`}
+                title={!alert?.aiAnalysis ? "Requires AI analysis - click 'AI Alert Analysis' first" : "Generate immediate action playbook for urgent containment steps"}
+              >
+                {immediatePlaybookLoading ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    <span>Generating...</span>
+                  </>
+                ) : (
+                  <>
+                    <Zap className="h-4 w-4" />
+                    <span>Generate Immediate Playbook</span>
+                    {!alert?.aiAnalysis && (
+                      <span className="text-xs opacity-75">(Requires AI Analysis)</span>
+                    )}
+                  </>
+                )}
+              </button>
+
+              {/* Generate Investigation Playbook Button */}
+              <button 
+                onClick={handleGenerateInvestigationPlaybook}
+                disabled={isEditing || investigationPlaybookLoading || !alert?.aiAnalysis}
+                className={`w-full px-4 py-2 rounded-lg font-medium transition-all duration-200 flex items-center justify-center space-x-2 ${
+                  isEditing || investigationPlaybookLoading || !alert?.aiAnalysis 
+                    ? 'bg-slate-600 text-slate-400 cursor-not-allowed opacity-60 border border-slate-500' 
+                    : 'bg-gradient-to-r from-purple-600 to-purple-700 hover:from-purple-700 hover:to-purple-800 text-white'
+                }`}
+                title={!alert?.aiAnalysis ? "Requires AI analysis - click 'AI Alert Analysis' first" : "Generate investigation playbook for detailed forensic procedures"}
+              >
+                {investigationPlaybookLoading ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    <span>Generating...</span>
+                  </>
+                ) : (
+                  <>
+                    <Eye className="h-4 w-4" />
+                    <span>Generate Investigation Playbook</span>
+                    {!alert?.aiAnalysis && (
+                      <span className="text-xs opacity-75">(Requires AI Analysis)</span>
+                    )}
+                  </>
+                )}
+              </button>
+
+              {/* Playbook Generation Error */}
+              {playbookError && (
+                <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-3">
+                  <div className="flex items-start space-x-2">
+                    <AlertCircle className="h-4 w-4 text-red-400 mt-0.5 flex-shrink-0" />
+                    <div>
+                      <p className="text-sm text-red-300 font-medium">Playbook Generation Failed</p>
+                      <p className="text-xs text-red-400 mt-1">{playbookError}</p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => setPlaybookError(null)}
+                    className="mt-2 text-xs text-red-400 hover:text-red-300 underline"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Timeline */}
+          <div className="bg-soc-dark-800/50 border border-soc-dark-700 rounded-lg p-6">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-medium text-white">Timeline</h3>
+              {timelineLoading && (
+                <Loader2 className="h-4 w-4 text-slate-400 animate-spin" />
+              )}
+            </div>
+            <div className="space-y-4">
+              {timeline.length === 0 && !timelineLoading ? (
+                <p className="text-sm text-slate-400">No timeline events available</p>
+              ) : (
+                timeline.map((event) => {
+                  const { icon: Icon, color } = getTimelineEventIcon(event.type);
+                  const isAIEvent = event.aiSource || event.type.includes('ai_');
+                  
+                  return (
+                    <div key={event.id} className="flex items-start space-x-3" data-testid="timeline-event">
+                      <div className={`flex items-center justify-center w-8 h-8 ${color} rounded-full text-white flex-shrink-0`}>
+                        <Icon className="h-4 w-4" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center space-x-2">
+                          <p className="text-sm font-medium text-white">{event.title}</p>
+                          {isAIEvent && (
+                            <span className="px-2 py-1 text-xs bg-purple-500/20 text-purple-300 border border-purple-500/30 rounded-full">
+                              🤖 AI
+                            </span>
+                          )}
+                          {event.aiConfidence && (
+                            <span className="px-2 py-1 text-xs bg-green-500/20 text-green-300 border border-green-500/30 rounded-full">
+                              {event.aiConfidence}% confidence
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-sm text-slate-300 mt-1 break-words">{event.description}</p>
+                        <div className="flex items-center justify-between mt-2">
+                          <p className="text-xs text-slate-400">
+                            {formatDistanceToNow(event.timestamp, { addSuffix: true })}
+                          </p>
+                          {event.user && (
+                            <p className="text-xs text-slate-400">
+                              by {event.user.firstName} {event.user.lastName}
+                            </p>
+                          )}
+                          {event.userName && !event.user && (
+                            <p className="text-xs text-slate-400">
+                              by {event.userName}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Incident Creation Modal */}
+      {showIncidentModal && (
+        <IncidentCreateModal
+          isOpen={showIncidentModal}
+          onClose={() => setShowIncidentModal(false)}
+          onSuccess={handleIncidentCreated}
+          sourceAlert={alert}
+        />
+      )}
+
+      {/* One Click Analysis Modal with Error Boundary */}
+      <AnalysisErrorBoundary onClose={() => setShowOneClickAnalysisModal(false)}>
+        <OneClickAnalysisModal
+          isOpen={showOneClickAnalysisModal}
+          onClose={() => setShowOneClickAnalysisModal(false)}
+          alert={alert}
+          onAnalysisComplete={handleOneClickAnalysisComplete}
+        />
+      </AnalysisErrorBoundary>
+
+      {/* Resolve Alert Modal */}
+      {showResolveModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50">
+          <div className="bg-soc-dark-900 border border-soc-dark-700 rounded-lg p-6 w-full max-w-md">
+            <h2 className="text-xl font-bold text-white mb-4">
+              {resolveFormData.resolution === 'false_positive' ? 'Mark as False Positive' : 'Resolve Alert'}
+            </h2>
+            
+            <form onSubmit={handleResolveSubmit} className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-slate-300 mb-2">
+                  Resolution Type
+                </label>
+                <select
+                  value={resolveFormData.resolution}
+                  onChange={(e) => setResolveFormData({
+                    ...resolveFormData,
+                    resolution: e.target.value as 'resolved' | 'false_positive'
+                  })}
+                  className="w-full px-3 py-2 bg-soc-dark-800 border border-soc-dark-700 rounded-lg text-white focus:ring-2 focus:ring-opensoc-500 focus:border-opensoc-500"
+                >
+                  <option value="resolved">Resolved</option>
+                  <option value="false_positive">False Positive</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-300 mb-2">
+                  Resolution Remarks <span className="text-red-400">*</span>
+                </label>
+                <textarea
+                  value={resolveFormData.remarks}
+                  onChange={(e) => setResolveFormData({
+                    ...resolveFormData,
+                    remarks: e.target.value
+                  })}
+                  placeholder="Explain why this alert is being resolved/marked as false positive..."
+                  rows={4}
+                  className="w-full px-3 py-2 bg-soc-dark-800 border border-soc-dark-700 rounded-lg text-white placeholder-slate-500 focus:ring-2 focus:ring-opensoc-500 focus:border-opensoc-500"
+                  required
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-300 mb-2">
+                  Additional Reasoning (Optional)
+                </label>
+                <textarea
+                  value={resolveFormData.reasoning}
+                  onChange={(e) => setResolveFormData({
+                    ...resolveFormData,
+                    reasoning: e.target.value
+                  })}
+                  placeholder="Additional technical details or context..."
+                  rows={3}
+                  className="w-full px-3 py-2 bg-soc-dark-800 border border-soc-dark-700 rounded-lg text-white placeholder-slate-500 focus:ring-2 focus:ring-opensoc-500 focus:border-opensoc-500"
+                />
+              </div>
+
+              <div className="flex space-x-3 pt-4">
+                <button
+                  type="submit"
+                  disabled={updating || !resolveFormData.remarks.trim()}
+                  className="flex-1 bg-opensoc-600 hover:bg-opensoc-700 disabled:bg-opensoc-800 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg font-medium transition-colors"
+                >
+                  {updating ? (
+                    <div className="flex items-center justify-center">
+                      <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                      {resolveFormData.resolution === 'false_positive' ? 'Marking...' : 'Resolving...'}
+                    </div>
+                  ) : (
+                    resolveFormData.resolution === 'false_positive' ? 'Mark as False Positive' : 'Resolve Alert'
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowResolveModal(false);
+                    setResolveFormData({
+                      resolution: 'resolved',
+                      remarks: '',
+                      reasoning: ''
+                    });
+                  }}
+                  disabled={updating}
+                  className="px-4 py-2 bg-soc-dark-700 hover:bg-soc-dark-600 text-white rounded-lg border border-soc-dark-600 transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default AlertDetailsPage;

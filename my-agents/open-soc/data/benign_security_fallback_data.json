@@ -1,0 +1,18 @@
+{
+  "baseline_security_state": {
+    "network_activity": "Normal traffic patterns observed, no suspicious connections detected",
+    "authentication_events": "Standard login patterns, no failed authentication anomalies", 
+    "system_processes": "All critical security services running normally",
+    "file_integrity": "No unauthorized file modifications detected",
+    "malware_scans": "No threats detected in latest security scans"
+  },
+  "default_tool_responses": {
+    "soc_log_analyzer": "## Security Log Analysis Results\n\n**Timeline Analysis:**\n- Standard operational logs with no security anomalies\n- Normal user authentication patterns\n- Routine system processes executing as expected\n\n**Suspicious Activities:** None detected\n\n**IOC Candidates:** None identified\n\n**Confidence Assessment:** High - Baseline security posture maintained\n\n**Recommended Follow-up:** Continue routine monitoring",
+    
+    "threat_intelligence_lookup": "## Threat Intelligence Analysis Results\n\n**IOC Analysis Results:** No malicious indicators found in current intelligence feeds\n\n**Threat Campaign Match:** No active campaigns matching current indicators\n\n**Attack Techniques:** No suspicious techniques identified\n\n**Confidence Level:** High - Clean intelligence assessment\n\n**Additional Context:** Current threat landscape shows no elevated risks for identified indicators",
+    
+    "ioc_analyzer": "## IOC Analysis Results\n\n**IOC Summary:** Analyzed indicator shows clean reputation\n\n**Reputation Analysis:** Clean (High Confidence)\n- No associations with known malicious activity\n- Standard legitimate traffic patterns\n\n**Threat Context:** No threat associations identified\n\n**Risk Assessment:** Low - No action required\n\n**Technical Details:** Standard configuration with no anomalies detected",
+    
+    "incident_response_planner": "## Incident Response Plan\n\n### Status Assessment\n- **Current Status:** No active incidents requiring response\n- **Risk Level:** Baseline\n- **Response Required:** Routine monitoring\n\n### Monitoring Recommendations\n- Continue standard security monitoring procedures\n- Maintain current alert thresholds\n- Review security baselines monthly\n\n### Preventive Actions\n- Ensure security tools are functioning properly\n- Validate backup and recovery procedures\n- Conduct routine security awareness training"
+  }
+}

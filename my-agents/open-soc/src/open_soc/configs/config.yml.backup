@@ -1,0 +1,116 @@
+general:
+  use_uvloop: true
+  logging:
+    console:
+      _type: console
+      level: WARN
+
+functions:
+  hello_test_agent:
+    _type: hello_test_agent
+    llm_name: soc_tool_llm
+    offline_mode: false
+    max_retries: 10
+  soc_log_analyzer:
+    _type: soc_log_analyzer
+    llm_name: soc_tool_llm
+    offline_mode: true
+  threat_intelligence_lookup:
+    _type: threat_intelligence_lookup
+    llm_name: soc_tool_llm
+    offline_mode: true
+  ioc_analyzer:
+    _type: ioc_analyzer
+    llm_name: soc_tool_llm
+    offline_mode: true
+  incident_response_planner:
+    _type: incident_response_planner
+    llm_name: soc_tool_llm
+    offline_mode: true
+  security_event_classifier:
+    _type: security_event_classifier
+    llm_name: soc_classifier_llm
+  virustotal_analyzer:
+    _type: virustotal_analyzer
+    llm_name: soc_tool_llm
+    offline_mode: false
+    api_key: "${VIRUSTOTAL_API_KEY}"
+    base_url: "https://www.virustotal.com/api/v3"
+    rate_limit: 4
+  playbook_specialist:
+    _type: playbook_specialist
+    llm_name: soc_tool_llm
+    offline_mode: true
+  threat_hunting_specialist:
+    _type: threat_hunting_specialist
+    llm_name: soc_tool_llm
+    offline_mode: false
+    api_key: "${THREATFOX_API_KEY}"
+    base_url: "https://threatfox-api.abuse.ch/api/v1"
+    rate_limit_delay: 1.0
+  orchestration_coordinator:
+    _type: orchestration_coordinator
+    llm_name: soc_tool_llm
+    offline_mode: true
+    max_iocs_per_analysis: 10
+    enable_script_generation: true
+    script_safety_validation: true
+  script_generator:
+    _type: script_generator
+    llm_name: soc_tool_llm
+    offline_mode: true
+    enable_dangerous_operations: false
+    script_safety_level: "safe"
+    max_script_length: 500
+  takedown_specialist:
+    _type: takedown_specialist
+    llm_name: soc_tool_llm
+    offline_mode: true
+    enable_aggressive_actions: false
+    isolation_level: "network"
+    auto_execution: false
+
+workflow:
+  _type: soc_agent
+  tool_names:
+    - hello_test_agent
+    - soc_log_analyzer
+    - threat_intelligence_lookup
+    - ioc_analyzer
+    - incident_response_planner
+    - virustotal_analyzer
+    - playbook_specialist
+    - threat_hunting_specialist
+    - orchestration_coordinator
+    - script_generator
+    - takedown_specialist
+  llm_name: soc_main_llm
+  offline_mode: true
+  offline_data_path: my-agents/open-soc/data/offline_security_data.csv
+  benign_fallback_data_path: my-agents/open-soc/data/benign_security_fallback_data.json
+
+llms:
+  soc_main_llm:
+    _type: openai
+    base_url: "${LLM_BASE_URL}/v1"
+    api_key: "not-needed"
+    model_name: gpt-oss:20b
+    temperature: 0.2
+    max_tokens: 2048
+
+  soc_tool_llm:
+    _type: openai
+    base_url: "${LLM_BASE_URL}/v1"
+    api_key: "not-needed"
+    model_name: gpt-oss:20b
+    temperature: 0.2
+    top_p: 0.7
+    max_tokens: 1024
+
+  soc_classifier_llm:
+    _type: openai
+    base_url: "${LLM_BASE_URL}/v1"
+    api_key: "not-needed"
+    model_name: gpt-oss:20b
+    temperature: 0
+    max_tokens: 512

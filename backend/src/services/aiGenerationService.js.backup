@@ -1,0 +1,2477 @@
+const axios = require('axios');
+const { models } = require('../database/models');
+
+class AIGenerationService {
+  constructor() {
+    // Use environment variables with fallbacks
+    this.ollamaHost = process.env.OLLAMA_HOST || '192.168.8.21';
+    this.ollamaPort = process.env.OLLAMA_PORT || 11434;
+    this.model = process.env.OLLAMA_MODEL || 'gpt-oss:20b';
+    this.baseURL = `http://${this.ollamaHost}:${this.ollamaPort}`;
+    this.connectionTimeout = parseInt(process.env.OLLAMA_CONNECTION_TIMEOUT || '5000'); // 5 seconds for connection checks
+    this.generationTimeout = parseInt(process.env.OLLAMA_GENERATION_TIMEOUT || '120000'); // 2 minutes for AI generation
+  }
+
+  /**
+   * Check if Ollama is available and model is loaded
+   */
+  async checkConnection() {
+    const startTime = Date.now();
+    
+    try {
+      // First, check basic connectivity
+      const versionResponse = await axios.get(`${this.baseURL}/api/version`, {
+        timeout: this.connectionTimeout,
+      });
+      
+      const serverVersion = versionResponse.data?.version || 'Unknown';
+      
+      // Then check available models
+      const modelsResponse = await axios.get(`${this.baseURL}/api/tags`, {
+        timeout: this.connectionTimeout,
+      });
+      
+      const availableModels = modelsResponse.data.models || [];
+      const modelExists = availableModels.some(model => model.name.includes(this.model.split(':')[0]));
+      const targetModel = availableModels.find(model => model.name === this.model);
+      
+      const connectionTime = Date.now() - startTime;
+      
+      return {
+        connected: true,
+        modelAvailable: modelExists,
+        serverVersion,
+        connectionTime,
+        totalModels: availableModels.length,
+        availableModels: availableModels.map(m => m.name),
+        targetModelInfo: targetModel ? {
+          name: targetModel.name,
+          size: targetModel.size,
+          modified: targetModel.modified_at,
+          family: targetModel.details?.family || 'unknown'
+        } : null,
+        endpoint: this.baseURL,
+        checkedAt: new Date().toISOString()
+      };
+    } catch (error) {
+      const connectionTime = Date.now() - startTime;
+      console.error('Ollama connection check failed:', error.message);
+      
+      // Categorize the error
+      let errorCategory = 'unknown';
+      if (error.code === 'ECONNREFUSED') {
+        errorCategory = 'connection_refused';
+      } else if (error.code === 'ETIMEDOUT') {
+        errorCategory = 'timeout';
+      } else if (error.code === 'ENOTFOUND') {
+        errorCategory = 'dns_error';
+      }
+      
+      return {
+        connected: false,
+        modelAvailable: false,
+        error: error.message,
+        errorCategory,
+        connectionTime,
+        endpoint: this.baseURL,
+        checkedAt: new Date().toISOString()
+      };
+    }
+  }
+
+  /**
+   * Generate test alerts using AI
+   */
+  async generateTestAlerts(config) {
+    const { quantity, severityDistribution, scenario, timeRange, organizationId, userId } = config;
+    
+    // Check if AI is available first
+    const aiStatus = await this.checkConnection();
+    if (!aiStatus.connected || !aiStatus.modelAvailable) {
+      const errorMsg = `AI service unavailable: ${!aiStatus.connected ? 'Cannot connect to Ollama at ' + this.baseURL : 'Model ' + this.model + ' not available'}`;
+      console.error('Alert generation failed:', errorMsg);
+      throw new Error(errorMsg);
+    }
+    
+    const prompt = this.buildAlertGenerationPrompt(quantity, severityDistribution, scenario, timeRange);
+    const startTime = Date.now();
+    
+    try {
+      const aiResponse = await this.callOllama(prompt);
+      const executionTime = Date.now() - startTime;
+      const alerts = this.parseAlertResponse(aiResponse);
+
+      // Store AI generation details for later end-to-end logging
+      this._storeGenerationContext({
+        userId,
+        organizationId,
+        dataType: 'alert',
+        quantity,
+        scenario,
+        prompt,
+        aiResponse,
+        aiSuccess: true,
+        aiExecutionTime: executionTime,
+        aiModel: this.model,
+        aiProvider: 'Ollama',
+        aiEndpoint: this.baseURL,
+        modelVersion: this.model,
+        providerMetadata: {
+          ollamaHost: this.ollamaHost,
+          ollamaPort: this.ollamaPort,
+          connectionTimeout: this.connectionTimeout,
+          generationTimeout: this.generationTimeout,
+        },
+        metadata: {
+          severityDistribution,
+          timeRange,
+          alertCount: alerts.length
+        }
+      });
+      
+      // Add organizational context and metadata
+      return alerts.map(alert => ({
+        ...alert,
+        organizationId,
+        isTestData: true,
+        sourceSystem: 'TestDataGenerator',
+        enrichmentData: {
+          generationTimestamp: new Date().toISOString(),
+          scenario: scenario,
+          aiGenerated: true,
+        },
+      }));
+    } catch (error) {
+      const executionTime = Date.now() - startTime;
+      console.error('Alert generation failed:', error);
+
+      // Store AI generation failure details for later end-to-end logging
+      this._storeGenerationContext({
+        userId,
+        organizationId,
+        dataType: 'alert',
+        quantity,
+        scenario,
+        prompt,
+        aiResponse: null,
+        aiSuccess: false,
+        aiError: error.message,
+        aiExecutionTime: executionTime,
+        aiModel: this.model,
+        aiProvider: 'Ollama',
+        aiEndpoint: this.baseURL,
+        modelVersion: this.model,
+        providerMetadata: {
+          ollamaHost: this.ollamaHost,
+          ollamaPort: this.ollamaPort,
+          connectionTimeout: this.connectionTimeout,
+          generationTimeout: this.generationTimeout,
+        },
+        metadata: {
+          severityDistribution,
+          timeRange,
+          errorType: 'AI_GENERATION_FAILED'
+        }
+      });
+      
+      throw error;
+    }
+  }
+
+  /**
+   * Generate test incidents using AI
+   */
+  async generateTestIncidents(config) {
+    const { quantity, scenario, timeRange, organizationId, userId } = config;
+    
+    // Check if AI is available first
+    const aiStatus = await this.checkConnection();
+    if (!aiStatus.connected || !aiStatus.modelAvailable) {
+      const errorMsg = `AI service unavailable: ${!aiStatus.connected ? 'Cannot connect to Ollama at ' + this.baseURL : 'Model ' + this.model + ' not available'}`;
+      console.error('Incident generation failed:', errorMsg);
+      throw new Error(errorMsg);
+    }
+    
+    // Query existing alerts for potential real alert ID references
+    let availableAlerts = [];
+    try {
+      const { models } = require('../database/models');
+      const alerts = await models.Alert.findAll({
+        where: { organizationId },
+        attributes: ['id', 'title', 'severity', 'assetName'],
+        limit: 20,
+        order: [['createdAt', 'DESC']]
+      });
+      availableAlerts = alerts.map(alert => ({
+        id: alert.id,
+        title: alert.title,
+        severity: alert.severity,
+        assetName: alert.assetName
+      }));
+      console.log(`🔧 Found ${availableAlerts.length} existing alerts for incident generation reference`);
+    } catch (error) {
+      console.warn('Could not query existing alerts for incident generation:', error.message);
+    }
+    
+    const prompt = this.buildIncidentGenerationPrompt(quantity, scenario, timeRange, availableAlerts);
+    const startTime = Date.now();
+    
+    try {
+      const aiResponse = await this.callOllama(prompt);
+      const executionTime = Date.now() - startTime;
+      const incidents = this.parseIncidentResponse(aiResponse);
+
+      // Store AI generation details for later end-to-end logging
+      this._storeGenerationContext({
+        userId,
+        organizationId,
+        dataType: 'incident',
+        quantity,
+        scenario,
+        prompt,
+        aiResponse,
+        aiSuccess: true,
+        aiExecutionTime: executionTime,
+        aiModel: this.model,
+        aiProvider: 'Ollama',
+        aiEndpoint: this.baseURL,
+        modelVersion: this.model,
+        providerMetadata: {
+          ollamaHost: this.ollamaHost,
+          ollamaPort: this.ollamaPort,
+          connectionTimeout: this.connectionTimeout,
+          generationTimeout: this.generationTimeout,
+        },
+        metadata: {
+          timeRange,
+          incidentCount: incidents.length
+        }
+      });
+      
+      return incidents.map(incident => ({
+        ...incident,
+        organizationId,
+        isTestData: true,
+        metadata: {
+          generationTimestamp: new Date().toISOString(),
+          scenario: scenario,
+          aiGenerated: true,
+        },
+      }));
+    } catch (error) {
+      const executionTime = Date.now() - startTime;
+      console.error('Incident generation failed:', error);
+
+      // Store AI generation failure details for later end-to-end logging
+      this._storeGenerationContext({
+        userId,
+        organizationId,
+        dataType: 'incident',
+        quantity,
+        scenario,
+        prompt,
+        aiResponse: null,
+        aiSuccess: false,
+        aiError: error.message,
+        aiExecutionTime: executionTime,
+        aiModel: this.model,
+        aiProvider: 'Ollama',
+        aiEndpoint: this.baseURL,
+        modelVersion: this.model,
+        providerMetadata: {
+          ollamaHost: this.ollamaHost,
+          ollamaPort: this.ollamaPort,
+          connectionTimeout: this.connectionTimeout,
+          generationTimeout: this.generationTimeout,
+        },
+        metadata: {
+          timeRange,
+          errorType: 'AI_GENERATION_FAILED'
+        }
+      });
+      
+      throw error;
+    }
+  }
+
+  /**
+   * Generate test assets using AI
+   */
+  async generateTestAssets(config) {
+    const { quantity, scenario, timeRange, organizationId, userId } = config;
+    
+    // Check if AI is available first
+    const aiStatus = await this.checkConnection();
+    if (!aiStatus.connected || !aiStatus.modelAvailable) {
+      const errorMsg = `AI service unavailable: ${!aiStatus.connected ? 'Cannot connect to Ollama at ' + this.baseURL : 'Model ' + this.model + ' not available'}`;
+      console.error('Asset generation failed:', errorMsg);
+      throw new Error(errorMsg);
+    }
+    
+    const prompt = this.buildAssetGenerationPrompt(quantity, scenario, timeRange);
+    const startTime = Date.now();
+    
+    try {
+      const aiResponse = await this.callOllama(prompt);
+      const executionTime = Date.now() - startTime;
+      const assets = this.parseAssetResponse(aiResponse);
+
+      // Store AI generation details for later end-to-end logging
+      this._storeGenerationContext({
+        userId,
+        organizationId,
+        dataType: 'asset',
+        quantity,
+        scenario,
+        prompt,
+        aiResponse,
+        aiSuccess: true,
+        aiExecutionTime: executionTime,
+        aiModel: this.model,
+        aiProvider: 'Ollama',
+        aiEndpoint: this.baseURL,
+        modelVersion: this.model,
+        providerMetadata: {
+          ollamaHost: this.ollamaHost,
+          ollamaPort: this.ollamaPort,
+          connectionTimeout: this.connectionTimeout,
+          generationTimeout: this.generationTimeout,
+        },
+        metadata: {
+          timeRange,
+          assetCount: assets.length
+        }
+      });
+      
+      return assets.map(asset => ({
+        ...asset,
+        organizationId,
+        isTestData: true,
+        metadata: {
+          generationTimestamp: new Date().toISOString(),
+          scenario: scenario,
+          aiGenerated: true,
+        },
+      }));
+    } catch (error) {
+      const executionTime = Date.now() - startTime;
+      console.error('Asset generation failed:', error);
+
+      // Log failed generation
+      await this.logAIGeneration({
+        userId,
+        organizationId,
+        dataType: 'asset',
+        quantity,
+        scenario,
+        prompt,
+        aiResponse: null,
+        success: false,
+        errorMessage: error.message,
+        executionTime,
+        aiModel: this.model,
+        aiProvider: 'Ollama',
+        aiEndpoint: this.baseURL,
+        modelVersion: this.model,
+        providerMetadata: {
+          ollamaHost: this.ollamaHost,
+          ollamaPort: this.ollamaPort,
+          connectionTimeout: this.connectionTimeout,
+          generationTimeout: this.generationTimeout,
+        },
+        metadata: {
+          timeRange,
+          errorType: 'AI_GENERATION_FAILED'
+        }
+      });
+      
+      throw error;
+    }
+  }
+
+  /**
+   * Generate test IOCs using AI
+   */
+  async generateTestIOCs(config) {
+    const { quantity, scenario, timeRange, organizationId, userId } = config;
+    
+    // Check if AI is available first
+    const aiStatus = await this.checkConnection();
+    if (!aiStatus.connected || !aiStatus.modelAvailable) {
+      const errorMsg = `AI service unavailable: ${!aiStatus.connected ? 'Cannot connect to Ollama at ' + this.baseURL : 'Model ' + this.model + ' not available'}`;
+      console.error('IOC generation failed:', errorMsg);
+      throw new Error(errorMsg);
+    }
+    
+    const prompt = this.buildIOCGenerationPrompt(quantity, scenario, timeRange);
+    const startTime = Date.now();
+    
+    try {
+      const aiResponse = await this.callOllama(prompt);
+      const executionTime = Date.now() - startTime;
+      const iocs = this.parseIOCResponse(aiResponse);
+
+      // Log successful generation
+      await this.logAIGeneration({
+        userId,
+        organizationId,
+        dataType: 'ioc',
+        quantity,
+        scenario,
+        prompt,
+        aiResponse,
+        success: true,
+        executionTime,
+        aiModel: this.model,
+        aiProvider: 'Ollama',
+        aiEndpoint: this.baseURL,
+        modelVersion: this.model,
+        providerMetadata: {
+          ollamaHost: this.ollamaHost,
+          ollamaPort: this.ollamaPort,
+          connectionTimeout: this.connectionTimeout,
+          generationTimeout: this.generationTimeout,
+        },
+        metadata: {
+          timeRange,
+          iocCount: iocs.length
+        }
+      });
+      
+      return iocs.map(ioc => ({
+        ...ioc,
+        organizationId,
+        isTestData: true,
+      }));
+    } catch (error) {
+      const executionTime = Date.now() - startTime;
+      console.error('IOC generation failed:', error);
+
+      // Log failed generation
+      await this.logAIGeneration({
+        userId,
+        organizationId,
+        dataType: 'ioc',
+        quantity,
+        scenario,
+        prompt,
+        aiResponse: null,
+        success: false,
+        errorMessage: error.message,
+        executionTime,
+        aiModel: this.model,
+        aiProvider: 'Ollama',
+        aiEndpoint: this.baseURL,
+        modelVersion: this.model,
+        providerMetadata: {
+          ollamaHost: this.ollamaHost,
+          ollamaPort: this.ollamaPort,
+          connectionTimeout: this.connectionTimeout,
+          generationTimeout: this.generationTimeout,
+        },
+        metadata: {
+          timeRange,
+          errorType: 'AI_GENERATION_FAILED'
+        }
+      });
+      
+      throw error;
+    }
+  }
+
+  /**
+   * Generate test playbooks using AI
+   */
+  async generateTestPlaybooks(config) {
+    const { quantity, scenario, timeRange, organizationId, userId } = config;
+    
+    // Check if AI is available first
+    const aiStatus = await this.checkConnection();
+    if (!aiStatus.connected || !aiStatus.modelAvailable) {
+      const errorMsg = `AI service unavailable: ${!aiStatus.connected ? 'Cannot connect to Ollama at ' + this.baseURL : 'Model ' + this.model + ' not available'}`;
+      console.error('Playbook generation failed:', errorMsg);
+      throw new Error(errorMsg);
+    }
+    
+    const prompt = this.buildPlaybookGenerationPrompt(quantity, scenario, timeRange);
+    const startTime = Date.now();
+    
+    try {
+      const aiResponse = await this.callOllama(prompt);
+      const executionTime = Date.now() - startTime;
+      const playbooks = this.parsePlaybookResponse(aiResponse);
+
+      // Log successful generation
+      await this.logAIGeneration({
+        userId,
+        organizationId,
+        dataType: 'playbook',
+        quantity,
+        scenario,
+        prompt,
+        aiResponse,
+        success: true,
+        executionTime,
+        aiModel: this.model,
+        aiProvider: 'Ollama',
+        aiEndpoint: this.baseURL,
+        modelVersion: this.model,
+        providerMetadata: {
+          ollamaHost: this.ollamaHost,
+          ollamaPort: this.ollamaPort,
+          connectionTimeout: this.connectionTimeout,
+          generationTimeout: this.generationTimeout,
+        },
+        metadata: {
+          timeRange,
+          playbookCount: playbooks.length
+        }
+      });
+      
+      return playbooks.map(playbook => ({
+        ...playbook,
+        organizationId,
+        isTestData: true,
+      }));
+    } catch (error) {
+      const executionTime = Date.now() - startTime;
+      console.error('Playbook generation failed:', error);
+
+      // Log failed generation
+      await this.logAIGeneration({
+        userId,
+        organizationId,
+        dataType: 'playbook',
+        quantity,
+        scenario,
+        prompt,
+        aiResponse: null,
+        success: false,
+        errorMessage: error.message,
+        executionTime,
+        aiModel: this.model,
+        aiProvider: 'Ollama',
+        aiEndpoint: this.baseURL,
+        modelVersion: this.model,
+        providerMetadata: {
+          ollamaHost: this.ollamaHost,
+          ollamaPort: this.ollamaPort,
+          connectionTimeout: this.connectionTimeout,
+          generationTimeout: this.generationTimeout,
+        },
+        metadata: {
+          timeRange,
+          errorType: 'AI_GENERATION_FAILED'
+        }
+      });
+      
+      throw error;
+    }
+  }
+
+  /**
+   * Generate test threat actors using AI
+   */
+  async generateTestThreatActors(config) {
+    const { quantity, scenario, timeRange, organizationId, userId } = config;
+    
+    // Check if AI is available first
+    const aiStatus = await this.checkConnection();
+    if (!aiStatus.connected || !aiStatus.modelAvailable) {
+      const errorMsg = `AI service unavailable: ${!aiStatus.connected ? 'Cannot connect to Ollama at ' + this.baseURL : 'Model ' + this.model + ' not available'}`;
+      console.error('Threat Actor generation failed:', errorMsg);
+      throw new Error(errorMsg);
+    }
+    
+    const prompt = this.buildThreatActorGenerationPrompt(quantity, scenario, timeRange);
+    const startTime = Date.now();
+    
+    try {
+      const aiResponse = await this.callOllama(prompt);
+      const executionTime = Date.now() - startTime;
+      const threatActors = this.parseThreatActorResponse(aiResponse);
+
+      // Store AI generation details for later end-to-end logging
+      this._storeGenerationContext({
+        userId,
+        organizationId,
+        dataType: 'threat_actor',
+        quantity,
+        scenario,
+        prompt,
+        aiResponse,
+        aiSuccess: true,
+        aiExecutionTime: executionTime,
+        aiModel: this.model,
+        aiProvider: 'Ollama',
+        aiEndpoint: this.baseURL,
+        modelVersion: this.model,
+        providerMetadata: {
+          ollamaHost: this.ollamaHost,
+          ollamaPort: this.ollamaPort,
+          connectionTimeout: this.connectionTimeout,
+          generationTimeout: this.generationTimeout,
+        },
+        metadata: {
+          timeRange,
+          threatActorCount: threatActors.length
+        }
+      });
+      
+      return threatActors.map(threatActor => ({
+        ...threatActor,
+        organizationId,
+        isTestData: true,
+      }));
+    } catch (error) {
+      const executionTime = Date.now() - startTime;
+      console.error('Threat Actor generation failed:', error);
+
+      // Store AI generation failure details for later end-to-end logging
+      this._storeGenerationContext({
+        userId,
+        organizationId,
+        dataType: 'threat_actor',
+        quantity,
+        scenario,
+        prompt,
+        aiResponse: null,
+        aiSuccess: false,
+        aiError: error.message,
+        aiExecutionTime: executionTime,
+        aiModel: this.model,
+        aiProvider: 'Ollama',
+        aiEndpoint: this.baseURL,
+        modelVersion: this.model,
+        providerMetadata: {
+          ollamaHost: this.ollamaHost,
+          ollamaPort: this.ollamaPort,
+          connectionTimeout: this.connectionTimeout,
+          generationTimeout: this.generationTimeout,
+        },
+        metadata: {
+          timeRange,
+          errorType: 'AI_GENERATION_FAILED'
+        }
+      });
+      
+      throw error;
+    }
+  }
+
+  /**
+   * Generate test threat campaigns using AI
+   */
+  async generateTestThreatCampaigns(config) {
+    const { quantity, scenario, timeRange, organizationId, userId } = config;
+    
+    // Check if AI is available first
+    const aiStatus = await this.checkConnection();
+    if (!aiStatus.connected || !aiStatus.modelAvailable) {
+      const errorMsg = `AI service unavailable: ${!aiStatus.connected ? 'Cannot connect to Ollama at ' + this.baseURL : 'Model ' + this.model + ' not available'}`;
+      console.error('Threat Campaign generation failed:', errorMsg);
+      throw new Error(errorMsg);
+    }
+    
+    const prompt = this.buildThreatCampaignGenerationPrompt(quantity, scenario, timeRange);
+    const startTime = Date.now();
+    
+    try {
+      const aiResponse = await this.callOllama(prompt);
+      const executionTime = Date.now() - startTime;
+      const threatCampaigns = this.parseThreatCampaignResponse(aiResponse);
+
+      // Store AI generation details for later end-to-end logging
+      this._storeGenerationContext({
+        userId,
+        organizationId,
+        dataType: 'threat_campaign',
+        quantity,
+        scenario,
+        prompt,
+        aiResponse,
+        aiSuccess: true,
+        aiExecutionTime: executionTime,
+        aiModel: this.model,
+        aiProvider: 'Ollama',
+        aiEndpoint: this.baseURL,
+        modelVersion: this.model,
+        providerMetadata: {
+          ollamaHost: this.ollamaHost,
+          ollamaPort: this.ollamaPort,
+          connectionTimeout: this.connectionTimeout,
+          generationTimeout: this.generationTimeout,
+        },
+        metadata: {
+          timeRange,
+          threatCampaignCount: threatCampaigns.length
+        }
+      });
+      
+      return threatCampaigns.map(campaign => ({
+        ...campaign,
+        organizationId,
+        isTestData: true,
+      }));
+    } catch (error) {
+      const executionTime = Date.now() - startTime;
+      console.error('Threat Campaign generation failed:', error);
+
+      // Store AI generation failure details for later end-to-end logging
+      this._storeGenerationContext({
+        userId,
+        organizationId,
+        dataType: 'threat_campaign',
+        quantity,
+        scenario,
+        prompt,
+        aiResponse: null,
+        aiSuccess: false,
+        aiError: error.message,
+        aiExecutionTime: executionTime,
+        aiModel: this.model,
+        aiProvider: 'Ollama',
+        aiEndpoint: this.baseURL,
+        modelVersion: this.model,
+        providerMetadata: {
+          ollamaHost: this.ollamaHost,
+          ollamaPort: this.ollamaPort,
+          connectionTimeout: this.connectionTimeout,
+          generationTimeout: this.generationTimeout,
+        },
+        metadata: {
+          timeRange,
+          errorType: 'AI_GENERATION_FAILED'
+        }
+      });
+      
+      throw error;
+    }
+  }
+
+  /**
+   * Generate AI response for chat using Ollama
+   */
+  async generateResponse(options = {}) {
+    const { prompt, model, maxTokens = 1000, temperature = 0.7 } = options;
+    
+    try {
+      console.log('🤖 Generating AI chat response with Ollama...');
+      console.log('📝 Prompt length:', prompt.length);
+      console.log('🔧 Model:', model || this.model);
+      console.log('🌐 Ollama URL:', this.baseURL);
+      
+      // Check if Ollama is available first
+      const connectionStatus = await this.checkConnection();
+      if (!connectionStatus.connected) {
+        console.warn('⚠️ Ollama not available, falling back to contextual stub');
+        return this.generateStubResponse(prompt, model);
+      }
+      
+      // Use the real Ollama API
+      const response = await this.callOllama(prompt);
+      
+      return {
+        response,
+        content: response,
+        model: model || this.model,
+        usage: {
+          promptTokens: Math.ceil(prompt.length / 4),
+          completionTokens: Math.ceil(response.length / 4),
+          totalTokens: Math.ceil((prompt.length + response.length) / 4)
+        }
+      };
+    } catch (error) {
+      console.error('❌ AI response generation failed:', error);
+      console.warn('⚠️ Falling back to contextual stub due to error');
+      return this.generateStubResponse(prompt, model);
+    }
+  }
+  
+  /**
+   * Generate stub response when Ollama is not available
+   */
+  generateStubResponse(prompt, model) {
+    console.log('🤖 Using stub response...');
+    const response = this.generateContextualStubResponse(prompt);
+    
+    return {
+      response,
+      content: response,
+      model: model || 'stub-model',
+      usage: {
+        promptTokens: Math.ceil(prompt.length / 4),
+        completionTokens: Math.ceil(response.length / 4),
+        totalTokens: Math.ceil((prompt.length + response.length) / 4)
+      }
+    };
+  }
+
+  /**
+   * Generate contextual stub response based on prompt content
+   */
+  generateContextualStubResponse(prompt) {
+    const lowerPrompt = prompt.toLowerCase();
+    
+    // Security-related keywords
+    if (lowerPrompt.includes('alert') || lowerPrompt.includes('security')) {
+      return `# Security Analysis Summary
+
+I've analyzed the security alerts and incidents in your system. Here's what I can help you with:
+
+## Key Areas of Focus
+- **Threat Prioritization**: Identify critical alerts requiring immediate attention
+- **Incident Investigation**: Deep-dive analysis of security events
+- **Security Posture**: Recommendations for improving overall security
+
+## Next Steps
+What specific aspect would you like to focus on?
+
+> 💡 **Tip**: Ask about specific alert types or security metrics for detailed analysis.`;
+    }
+    
+    if (lowerPrompt.includes('incident') || lowerPrompt.includes('breach')) {
+      return `## 🔍 Incident Analysis Ready
+
+I'm reviewing the incident data in your SOC. Here's how I can assist:
+
+### Available Services
+- **Incident Analysis**: Deep-dive into specific security incidents
+- **Response Procedures**: Step-by-step incident response guidance  
+- **Pattern Recognition**: Identify trends and recurring attack vectors
+- **Timeline Analysis**: Reconstruct incident sequences
+
+### Quick Actions
+- Review recent critical incidents
+- Analyze incident response effectiveness
+- Identify security gaps from past incidents
+
+Would you like me to focus on any **specific incidents** or **timeframe**?`;
+    }
+    
+    if (lowerPrompt.includes('threat') || lowerPrompt.includes('ioc') || lowerPrompt.includes('indicator')) {
+      return "I've checked the latest threat intelligence and indicators of compromise. I can help you correlate threats with your current security events, provide context about specific IOCs, or suggest mitigation strategies. What would be most helpful?";
+    }
+    
+    if (lowerPrompt.includes('asset') || lowerPrompt.includes('inventory')) {
+      return "I've reviewed your asset inventory and security posture. I can help you identify vulnerable assets, analyze security coverage, or provide recommendations for asset protection. Which assets are you most concerned about?";
+    }
+    
+    if (lowerPrompt.includes('playbook') || lowerPrompt.includes('response') || lowerPrompt.includes('procedure')) {
+      return "I've examined your security playbooks and response procedures. I can help you optimize playbooks, suggest response actions for current incidents, or create new procedures based on emerging threats. What type of response guidance do you need?";
+    }
+    
+    if (lowerPrompt.includes('help') || lowerPrompt.includes('what') || lowerPrompt.includes('how')) {
+      return `# 🤖 AI SOC Consultant
+
+Welcome! I'm your AI Security Operations Center Consultant, ready to help with security operations.
+
+## 🛡️ Core Capabilities
+
+### Security Analysis
+- **Alert Analysis** - Prioritize and investigate security alerts
+- **Incident Response** - Guide through incident handling procedures
+- **Threat Intelligence** - IOC analysis and threat correlation
+- **Risk Assessment** - Evaluate security posture and vulnerabilities
+
+### Data Sources Available
+- \`alerts\` - Security event alerts from various sources
+- \`incidents\` - Active and historical incident data  
+- \`assets\` - Infrastructure and system inventory
+- \`iocs\` - Threat intelligence indicators
+- \`playbooks\` - Response procedures and workflows
+
+## 🚀 Getting Started
+
+Try asking me about:
+- \`"What alerts need my attention?"\`
+- \`"Analyze recent incidents"\`
+- \`"Show me threat indicators"\`
+- \`"Help with incident response"\`
+
+**What would you like to explore?**`;
+    }
+    
+    // Default response
+    return "As your AI SOC Consultant, I'm here to help with security operations and analysis. I have access to your alerts, incidents, assets, threat intelligence, and playbooks. I can provide insights, recommendations, and assistance with incident response. How can I help you today?";
+  }
+
+  /**
+   * Call Ollama API with prompt
+   */
+  async callOllama(prompt) {
+    const payload = {
+      model: this.model,
+      prompt: prompt,
+      stream: false,
+      options: {
+        temperature: 0.7,
+        top_p: 0.9,
+        max_tokens: 2000,
+      },
+    };
+
+    try {
+      const response = await axios.post(`${this.baseURL}/api/generate`, payload, {
+        timeout: this.generationTimeout, // Use longer timeout for AI generation
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (response.data && response.data.response) {
+        return response.data.response;
+      } else {
+        throw new Error('Invalid response from Ollama');
+      }
+    } catch (error) {
+      if (error.code === 'ECONNREFUSED') {
+        throw new Error(`Cannot connect to Ollama at ${this.baseURL}. Please ensure Ollama is running.`);
+      } else if (error.code === 'ETIMEDOUT') {
+        throw new Error('AI generation timed out. Please try again.');
+      } else {
+        throw new Error(`Ollama API error: ${error.message}`);
+      }
+    }
+  }
+
+  /**
+   * Build alert generation prompt
+   */
+  buildAlertGenerationPrompt(quantity, severityDistribution, scenario, timeRange) {
+    const scenarioDescriptions = {
+      mixed: 'various security threats including malware, network intrusions, and policy violations',
+      malware: 'malware infections, suspicious file executions, and antivirus detections',
+      brute_force: 'authentication attacks, failed login attempts, and account lockouts',
+      data_exfil: 'unauthorized data transfers, large file downloads, and suspicious network traffic',
+      insider_threat: 'policy violations, unauthorized access attempts, and suspicious user behavior',
+      network_intrusion: 'unauthorized network access, port scans, and suspicious connections',
+    };
+
+    const timeContext = this.getTimeContext(timeRange);
+    const severityInfo = Object.entries(severityDistribution)
+      .map(([level, percentage]) => `${level} (level ${this.getSeverityNumber(level)}): ${percentage}%`)
+      .join(', ');
+
+    return `Generate ${quantity} realistic cybersecurity alerts for SOC testing purposes. 
+
+REQUIREMENTS:
+- Focus on ${scenarioDescriptions[scenario] || scenarioDescriptions.mixed}
+- Time range: ${timeContext}
+- Severity distribution: ${severityInfo}
+- Include realistic asset names, IP addresses, and technical details
+- Vary the source systems (SIEM, Firewall, EDR, IDS, etc.)
+
+OUTPUT FORMAT (JSON array):
+[
+  {
+    "title": "Brief alert title",
+    "description": "Detailed technical description",
+    "severity": 1-5 (integer),
+    "sourceSystem": "Source system name",
+    "eventTime": "ISO timestamp within specified range",
+    "assetName": "Target asset name",
+    "rawData": {
+      "sourceIP": "IP address",
+      "destIP": "IP address",
+      "protocol": "Network protocol",
+      "additionalDetails": "Relevant technical data"
+    }
+  }
+]
+
+Generate realistic, varied alerts that would help test SOC workflows and AI automation. Each alert should be unique and technically accurate.`;
+  }
+
+  /**
+   * Build incident generation prompt
+   */
+  buildIncidentGenerationPrompt(quantity, scenario, timeRange, availableAlerts = []) {
+    const scenarioDescriptions = {
+      apt_campaign: 'Advanced Persistent Threat campaign with multiple attack stages',
+      ransomware: 'Ransomware infection with encryption activities and ransom demands',
+      data_breach: 'Data breach investigation with potential data exfiltration',
+      insider_threat: 'Internal threat investigation with policy violations',
+      supply_chain: 'Supply chain attack through compromised third-party components',
+    };
+
+    const categories = {
+      apt_campaign: 'intrusion',
+      ransomware: 'malware',
+      data_breach: 'data_breach',
+      insider_threat: 'insider_threat',
+      supply_chain: 'intrusion',
+    };
+
+    const timeContext = this.getTimeContext(timeRange);
+
+    // Build available alerts context for AI
+    let alertContext = '';
+    if (availableAlerts.length > 0) {
+      alertContext = `\n\nAVAILABLE ALERTS (you may optionally reference these real alert IDs):
+${availableAlerts.slice(0, 10).map(alert => 
+  `- ID: ${alert.id}, Title: "${alert.title}", Severity: ${alert.severity}, Asset: ${alert.assetName || 'N/A'}`
+).join('\n')}`;
+    }
+
+    return `Generate ${quantity} realistic cybersecurity incidents for SOC testing purposes.${alertContext}
+
+REQUIREMENTS:
+- Focus on ${scenarioDescriptions[scenario] || 'various security incidents'}
+- Category: ${categories[scenario] || 'malware'}
+- Time range: ${timeContext}
+- Realistic investigation steps and timeline events
+- Appropriate severity levels (3-5 for incidents)
+- Include alertCount indicating how many alerts would typically be associated (2-8)
+
+OUTPUT FORMAT (JSON array):
+[
+  {
+    "title": "Incident title",
+    "description": "Detailed incident description",
+    "severity": 3-5 (integer),
+    "category": "${categories[scenario] || 'malware'}",
+    "status": "open",
+    "alertIds": ["optional-array-of-real-alert-uuids-from-available-alerts"],
+    "alertCount": 2-8,
+    "metadata": {
+      "attackVector": "Initial attack vector",
+      "affectedSystems": ["system1", "system2"],
+      "timelineEvents": [
+        {
+          "timestamp": "ISO timestamp",
+          "type": "detection",
+          "description": "Event description"
+        }
+      ],
+      "iocs": ["indicator1", "indicator2"],
+      "recommendations": ["action1", "action2"]
+    }
+  }
+]
+
+IMPORTANT: 
+- alertIds is OPTIONAL - only include it if you want to reference specific alerts from the available alerts list
+- If you include alertIds, use ONLY the real UUIDs from the available alerts list above
+- If no suitable alerts are available, omit the alertIds field entirely
+- alertCount should reflect a realistic number regardless of whether you include alertIds
+
+Generate realistic incidents that would challenge SOC analysts and test incident response procedures.`;
+  }
+
+  /**
+   * Build asset generation prompt
+   */
+  buildAssetGenerationPrompt(quantity, scenario, timeRange) {
+    const scenarioDescriptions = {
+      corporate: 'corporate infrastructure with servers, workstations, and network devices',
+      cloud: 'cloud-based infrastructure with virtual machines and cloud services',
+      mixed: 'mixed on-premise and cloud infrastructure',
+      iot: 'IoT devices and industrial control systems',
+      remote_work: 'remote work infrastructure with laptops and mobile devices',
+    };
+
+    const timeContext = this.getTimeContext(timeRange);
+
+    return `Generate ${quantity} realistic IT assets for SOC testing and asset management purposes.
+
+REQUIREMENTS:
+- Focus on ${scenarioDescriptions[scenario] || scenarioDescriptions.mixed}
+- Include diverse asset types: servers, workstations, mobile devices, network equipment
+- Realistic naming conventions and IP addressing schemes
+- Proper operating systems and criticality levels
+- Last seen times within specified range: ${timeContext}
+
+OUTPUT FORMAT (JSON array):
+[
+  {
+    "name": "Asset name (e.g., DC-01, WS-USER-001)",
+    "assetType": "server|workstation|mobile_device|network_device|iot_device|virtual_machine|container|cloud_service",
+    "ipAddress": "Valid IP address or null if not applicable (e.g., for mobile devices without fixed IPs)",
+    "macAddress": "Valid MAC address",
+    "operatingSystem": "OS name and version",
+    "location": "Physical or logical location",
+    "owner": "Asset owner or department",
+    "criticality": "low|medium|high",
+    "environment": "production|staging|development|testing",
+    "lastSeen": "ISO timestamp within specified range",
+    "metadata": {
+      "manufacturer": "Hardware manufacturer",
+      "model": "Hardware model",
+      "serialNumber": "Serial number",
+      "installDate": "Installation date",
+      "warrantyExpiry": "Warranty expiration date"
+    }
+  }
+]
+
+Generate realistic, varied assets that would help test asset management and security monitoring systems.`;
+  }
+
+  /**
+   * Build IOC generation prompt
+   */
+  buildIOCGenerationPrompt(quantity, scenario, timeRange) {
+    const scenarioDescriptions = {
+      malware: 'malware-related indicators including file hashes and C2 infrastructure',
+      apt: 'Advanced Persistent Threat indicators with sophisticated TTPs',
+      phishing: 'phishing campaign indicators including domains and URLs',
+      ransomware: 'ransomware-related indicators and infrastructure',
+      botnet: 'botnet command and control indicators',
+      mixed: 'various threat intelligence indicators from different threat types',
+    };
+
+    const timeContext = this.getTimeContext(timeRange);
+
+    return `Generate ${quantity} realistic Indicators of Compromise (IOCs) for SOC testing and threat intelligence purposes.
+
+REQUIREMENTS:
+- Focus on ${scenarioDescriptions[scenario] || scenarioDescriptions.mixed}
+- Include diverse IOC types: IP addresses, domains, URLs, file hashes, email addresses
+- Realistic confidence levels and severity ratings
+- Proper threat intelligence context and MITRE ATT&CK mapping
+- First/last seen times within specified range: ${timeContext}
+
+OUTPUT FORMAT (JSON array):
+[
+  {
+    "type": "ip|domain|url|file_hash|email",
+    "value": "IOC value (IP, domain, hash, etc.)",
+    "confidence": "low|medium|high|very_high",
+    "severity": 1-5,
+    "description": "Detailed description of the threat",
+    "source": "Threat intelligence source",
+    "tags": ["tag1", "tag2", "tag3"],
+    "firstSeen": "ISO timestamp",
+    "lastSeen": "ISO timestamp",
+    "isActive": true|false,
+    "mitreAttack": ["T1001", "T1002"],
+    "metadata": {
+      "threatActor": "Associated threat actor",
+      "campaign": "Campaign name",
+      "malwareFamily": "Malware family",
+      "geolocation": "Country/region if applicable"
+    }
+  }
+]
+
+Generate realistic IOCs that would help test threat detection and intelligence systems.`;
+  }
+
+  /**
+   * Build playbook generation prompt
+   */
+  buildPlaybookGenerationPrompt(quantity, scenario, timeRange) {
+    const scenarioDescriptions = {
+      incident_response: 'incident response procedures for various security events',
+      malware_response: 'malware containment and remediation procedures',
+      data_breach: 'data breach investigation and response workflows',
+      phishing_response: 'phishing attack response and user education procedures',
+      insider_threat: 'insider threat investigation and mitigation procedures',
+      mixed: 'various security response playbooks for different threat scenarios',
+    };
+
+    const categories = {
+      incident_response: 'Incident Response',
+      malware_response: 'Malware Response',
+      data_breach: 'Data Breach',
+      phishing_response: 'Phishing',
+      insider_threat: 'Insider Threat',
+      mixed: 'General Security',
+    };
+
+    return `Generate ${quantity} realistic security response playbooks for SOC testing and incident response automation.
+
+REQUIREMENTS:
+- Focus on ${scenarioDescriptions[scenario] || scenarioDescriptions.mixed}
+- Category: ${categories[scenario] || categories.mixed}
+- Include detailed step-by-step procedures
+- Proper time estimates and required approvals
+- Mix of automated and manual steps
+- Realistic success rates and execution statistics
+
+OUTPUT FORMAT (JSON array):
+[
+  {
+    "name": "Playbook name",
+    "description": "Detailed playbook description",
+    "category": "${categories[scenario] || categories.mixed}",
+    "triggerType": "manual|automatic",
+    "isActive": true|false,
+    "steps": [
+      {
+        "id": "step-001",
+        "name": "Step name",
+        "type": "automated|manual",
+        "description": "Step description",
+        "timeout": 300,
+        "isRequired": true|false,
+        "order": 1
+      }
+    ],
+    "executionCount": 0-20,
+    "successRate": 70-100,
+    "averageExecutionTime": 1800-7200,
+    "metadata": {
+      "author": "Playbook author",
+      "version": "1.0",
+      "lastUpdated": "ISO timestamp",
+      "approvalRequired": true|false,
+      "skillLevel": "beginner|intermediate|advanced"
+    }
+  }
+]
+
+Generate realistic playbooks that would help test security orchestration and automated response systems.`;
+  }
+
+  /**
+   * Build threat actor generation prompt
+   */
+  buildThreatActorGenerationPrompt(quantity, scenario, timeRange) {
+    const scenarioDescriptions = {
+      apt: 'Advanced Persistent Threat groups with sophisticated state-sponsored capabilities',
+      cybercrime: 'financially motivated cybercriminal organizations and syndicates',
+      nation_state: 'state-sponsored cyber warfare and espionage groups',
+      ransomware: 'ransomware-as-a-service operators and affiliate groups',
+      hacktivist: 'ideologically motivated hacktivist collectives and groups',
+      mixed: 'diverse threat actors from various categories and motivations',
+    };
+
+    const timeContext = this.getTimeContext(timeRange);
+
+    return `Generate ${quantity} realistic threat actors for cybersecurity threat intelligence and SOC testing purposes.
+
+REQUIREMENTS:
+- Focus on ${scenarioDescriptions[scenario] || scenarioDescriptions.mixed}
+- Include realistic attribution and intelligence from ${timeContext}
+- Diverse sophistication levels and target sectors
+- Accurate MITRE ATT&CK techniques and tactics
+- Realistic aliases and naming conventions
+
+OUTPUT FORMAT (JSON array):
+[
+  {
+    "name": "Primary threat actor name",
+    "aliases": ["Alternative name 1", "Alternative name 2", "Alternative name 3"],
+    "description": "Detailed description of the threat actor, their capabilities, and operations",
+    "motivation": ["espionage", "financial-gain", "sabotage", "political-influence"],
+    "sophistication": "basic|intermediate|advanced|expert",
+    "origin": "Country or region of origin",
+    "targetSectors": ["government", "healthcare", "financial", "technology", "critical-infrastructure"],
+    "techniques": ["T1566.001", "T1055", "T1027", "T1078", "T1071.001"],
+    "campaigns": ["Known campaign name 1", "Known campaign name 2"],
+    "isActive": true|false,
+    "firstSeen": "ISO timestamp within specified range",
+    "lastSeen": "ISO timestamp within specified range",
+    "metadata": {
+      "attribution": "Attribution details",
+      "knownSince": "Year first identified",
+      "primaryObjective": "Main operational objective",
+      "notableCampaigns": ["Campaign 1", "Campaign 2"],
+      "infrastructure": "Infrastructure description",
+      "specialties": ["Specialty 1", "Specialty 2"]
+    }
+  }
+]
+
+Generate realistic, varied threat actors based on actual APT groups, cybercrime syndicates, and nation-state actors that would help test threat intelligence systems.`;
+  }
+
+  /**
+   * Build threat campaign generation prompt
+   */
+  buildThreatCampaignGenerationPrompt(quantity, scenario, timeRange) {
+    const scenarioDescriptions = {
+      espionage: 'cyber espionage campaigns targeting intellectual property and government secrets',
+      ransomware: 'ransomware campaigns with encryption and extortion operations',
+      supply_chain: 'supply chain attacks targeting software vendors and service providers',
+      election_interference: 'election interference and disinformation campaigns',
+      critical_infrastructure: 'attacks targeting critical infrastructure and utilities',
+      covid_themed: 'COVID-19 themed attacks exploiting pandemic-related concerns',
+      mixed: 'diverse cyber campaigns with various objectives and techniques',
+    };
+
+    const timeContext = this.getTimeContext(timeRange);
+
+    return `Generate ${quantity} realistic threat campaigns for cybersecurity threat intelligence and SOC testing purposes.
+
+REQUIREMENTS:
+- Focus on ${scenarioDescriptions[scenario] || scenarioDescriptions.mixed}
+- Campaign timeline within ${timeContext}
+- Realistic target selection and geographical scope
+- Accurate MITRE ATT&CK techniques and progression
+- Include campaign objectives and estimated impact
+
+OUTPUT FORMAT (JSON array):
+[
+  {
+    "name": "Campaign name (e.g., 'Operation CloudStrike')",
+    "description": "Detailed description of the campaign objectives, targets, and methods",
+    "startDate": "ISO timestamp for campaign start",
+    "endDate": "ISO timestamp for campaign end (null if ongoing)",
+    "isActive": true|false,
+    "targetSectors": ["healthcare", "government", "financial", "technology"],
+    "targetGeographies": ["United States", "European Union", "Southeast Asia"],
+    "techniques": ["T1566.001", "T1078", "T1055", "T1027", "T1041"],
+    "objectives": ["intellectual-property-theft", "financial-gain", "disruption"],
+    "severity": 1-5,
+    "confidence": "low|medium|high|very_high",
+    "victimCount": 50,
+    "estimatedImpact": "Financial or operational impact estimate",
+    "associatedIOCs": ["sample-ioc-1", "sample-ioc-2"],
+    "relatedIncidents": ["incident-1", "incident-2"],
+    "tags": ["apt", "supply-chain", "healthcare"],
+    "metadata": {
+      "campaignType": "Type of campaign",
+      "attackVectors": ["Initial attack vectors"],
+      "toolsUsed": ["Malware families and tools"],
+      "victimProfile": "Target victim profile",
+      "attribution": "Attribution assessment",
+      "timeline": [
+        {
+          "date": "ISO timestamp",
+          "event": "Campaign milestone or event"
+        }
+      ]
+    }
+  }
+]
+
+Generate realistic campaigns that would challenge threat analysts and test campaign tracking systems.`;
+  }
+
+  /**
+   * Parse AI response for alerts
+   */
+  parseAlertResponse(response) {
+    try {
+      console.log('🔍 Parsing alert response, length:', response?.length || 0);
+      
+      if (!response || response.trim().length === 0) {
+        throw new Error('Empty AI response - no data received from AI service');
+      }
+      
+      let jsonStr = response.trim();
+      
+      // Remove markdown code blocks
+      jsonStr = jsonStr.replace(/```json\s*/, '').replace(/```\s*$/, '');
+      
+      // Remove any leading/trailing non-JSON content
+      jsonStr = jsonStr.replace(/^[^[\{]*/, '').replace(/[^\]\}]*$/, '');
+      
+      // Try to extract JSON array
+      const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        jsonStr = jsonMatch[0];
+      }
+      
+      // Parse JSON with detailed error information
+      let alerts;
+      try {
+        alerts = JSON.parse(jsonStr);
+      } catch (parseError) {
+        console.error('JSON parse error details:', {
+          error: parseError.message,
+          responseLength: response.length,
+          jsonLength: jsonStr.length,
+          position: parseError.message.match(/position (\d+)/)?.[1]
+        });
+        
+        // Log the problematic area for debugging
+        const position = parseInt(parseError.message.match(/position (\d+)/)?.[1] || '0');
+        if (position > 0) {
+          const start = Math.max(0, position - 100);
+          const end = Math.min(jsonStr.length, position + 100);
+          console.error('Problematic JSON area around position', position, ':', jsonStr.substring(start, end));
+        }
+        
+        // Log first 500 and last 500 characters for debugging
+        console.error('AI response start:', response.substring(0, 500));
+        console.error('AI response end:', response.substring(Math.max(0, response.length - 500)));
+        
+        throw parseError;
+      }
+      
+      // Validate that we got an array
+      if (!Array.isArray(alerts)) {
+        throw new Error('AI response is not a valid JSON array');
+      }
+      
+      // Validate and filter alerts with strict validation
+      const validAlerts = alerts.filter(alert => 
+        alert && 
+        typeof alert === 'object' &&
+        alert.title && 
+        alert.description && 
+        alert.severity && 
+        Number.isInteger(alert.severity) && 
+        alert.severity >= 1 && 
+        alert.severity <= 5
+      );
+      
+      if (validAlerts.length === 0) {
+        throw new Error('No valid alerts found in AI response - all alerts missing required fields (title, description, valid severity 1-5)');
+      }
+      
+      console.log(`✅ Successfully parsed ${validAlerts.length} valid alerts from AI response`);
+      
+      return validAlerts.map(alert => ({
+        ...alert,
+        status: 'new',
+        eventTime: alert.eventTime || new Date().toISOString(),
+        assetName: alert.assetName || 'Unknown Asset',
+        sourceSystem: alert.sourceSystem || 'TestDataGenerator',
+        rawData: alert.rawData || {},
+        enrichmentData: {},
+      }));
+      
+    } catch (error) {
+      console.error('Failed to parse alert response:', error.message);
+      throw new Error(`Failed to parse AI response for alerts: ${error.message}`);
+    }
+  }
+
+  /**
+   * Parse AI response for incidents
+   */
+  parseIncidentResponse(response) {
+    try {
+      console.log('🔍 Parsing incident response, length:', response?.length || 0);
+      
+      if (!response || response.trim().length === 0) {
+        throw new Error('Empty AI response - no data received from AI service');
+      }
+      
+      // Try multiple parsing strategies
+      const parsingStrategies = [
+        this.parseWithObjectExtraction.bind(this),
+        this.parseWithEnhancedCleaning.bind(this),
+        this.parseWithFallbackExtraction.bind(this),
+        this.parseWithBasicCleaning.bind(this)
+      ];
+      
+      let lastError = null;
+      let incidents = null;
+      
+      for (const strategy of parsingStrategies) {
+        try {
+          console.log('🔄 Trying parsing strategy:', strategy.name);
+          incidents = strategy(response);
+          if (incidents && Array.isArray(incidents)) {
+            console.log('✅ Parsing successful with strategy:', strategy.name);
+            break;
+          }
+        } catch (error) {
+          console.log('❌ Strategy failed:', strategy.name, '-', error.message);
+          lastError = error;
+          continue;
+        }
+      }
+      
+      // If all strategies failed, log detailed error info and throw
+      if (!incidents) {
+        console.error('All parsing strategies failed for response:', {
+          responseLength: response.length,
+          lastError: lastError?.message
+        });
+        
+        // Log first 500 and last 500 characters for debugging
+        console.error('AI response start:', response.substring(0, 500));
+        console.error('AI response end:', response.substring(Math.max(0, response.length - 500)));
+        
+        throw lastError || new Error('All JSON parsing strategies failed');
+      }
+      
+      // Validate that we got an array
+      if (!Array.isArray(incidents)) {
+        throw new Error('AI response is not a valid JSON array');
+      }
+      
+      // Validate and filter incidents with detailed debugging
+      console.log('🔍 Validating', incidents.length, 'parsed incidents');
+      
+      const validIncidents = [];
+      const invalidIncidents = [];
+      
+      incidents.forEach((incident, index) => {
+        const missingFields = [];
+        
+        if (!incident || typeof incident !== 'object') {
+          invalidIncidents.push({ index, reason: 'Not an object', incident });
+          return;
+        }
+        
+        if (!incident.title) missingFields.push('title');
+        if (!incident.description) missingFields.push('description');  
+        if (!incident.severity) missingFields.push('severity');
+        if (!incident.category) missingFields.push('category');
+        
+        if (missingFields.length === 0) {
+          validIncidents.push(incident);
+          console.log(`✅ Incident ${index}: "${incident.title}" - VALID`);
+        } else {
+          invalidIncidents.push({ 
+            index, 
+            reason: `Missing fields: ${missingFields.join(', ')}`, 
+            incident,
+            availableFields: Object.keys(incident)
+          });
+          console.log(`❌ Incident ${index}: Missing ${missingFields.join(', ')} - Available: [${Object.keys(incident).join(', ')}]`);
+        }
+      });
+      
+      if (validIncidents.length === 0) {
+        console.error('🚨 No valid incidents found. Details:', {
+          totalParsed: incidents.length,
+          invalidCount: invalidIncidents.length,
+          invalidReasons: invalidIncidents.map(i => i.reason),
+          sampleInvalidIncident: invalidIncidents[0]?.incident
+        });
+        throw new Error(`No valid incidents found in AI response - all incidents missing required fields (title, description, severity, category). Found ${incidents.length} incidents, all invalid.`);
+      }
+      
+      console.log(`✅ Successfully parsed ${validIncidents.length} valid incidents from AI response`);
+      
+      return validIncidents.map(incident => ({
+        ...incident,
+        status: incident.status || 'open',
+        alertIds: incident.alertIds || [],
+        alertCount: incident.alertCount || 0,
+        metadata: incident.metadata || {},
+      }));
+      
+    } catch (error) {
+      console.error('Failed to parse incident response:', error.message);
+      throw new Error(`Failed to parse AI response for incidents: ${error.message}`);
+    }
+  }
+
+  /**
+   * Object extraction strategy - handle AI responses wrapped in JSON objects
+   */
+  parseWithObjectExtraction(response) {
+    console.log('🎯 Object extraction: Looking for incidents property in JSON objects');
+    let jsonStr = response.trim();
+    
+    // Remove markdown code blocks first
+    jsonStr = jsonStr.replace(/```(?:json|javascript|js)?\s*/gi, '');
+    jsonStr = jsonStr.replace(/```\s*$/gm, '');
+    
+    // Remove non-JSON content before first brace
+    jsonStr = jsonStr.replace(/^.*?(?=\{)/s, '');
+    
+    // For suffix removal, be more careful - only remove obvious non-JSON at the end
+    jsonStr = jsonStr.replace(/\n\s*\w+.*$/s, ''); // Remove trailing text lines
+    
+    // Look for complete JSON objects that might contain an "incidents" property
+    // Use a more sophisticated approach to find balanced braces
+    const objectMatches = [];
+    let braceCount = 0;
+    let startIndex = -1;
+    
+    for (let i = 0; i < jsonStr.length; i++) {
+      if (jsonStr[i] === '{') {
+        if (braceCount === 0) {
+          startIndex = i;
+        }
+        braceCount++;
+      } else if (jsonStr[i] === '}') {
+        braceCount--;
+        if (braceCount === 0 && startIndex !== -1) {
+          objectMatches.push(jsonStr.substring(startIndex, i + 1));
+          startIndex = -1;
+        }
+      }
+    }
+    
+    console.log('🔍 Found', objectMatches.length, 'complete JSON object(s)');
+    
+    for (const match of objectMatches.sort((a, b) => b.length - a.length)) {
+      try {
+        const parsed = JSON.parse(match);
+        console.log('📋 Parsed object with keys:', Object.keys(parsed));
+        
+        // Look for incidents property
+        if (parsed.incidents && Array.isArray(parsed.incidents)) {
+          console.log('✅ Found incidents array with', parsed.incidents.length, 'item(s)');
+          return parsed.incidents;
+        }
+        
+        // Look for other array properties that might contain incidents
+        for (const [key, value] of Object.entries(parsed)) {
+          if (Array.isArray(value) && value.length > 0) {
+            // Check if array contains incident-like objects
+            const hasIncidentLikeObjects = value.some(item =>
+              item && typeof item === 'object' && 
+              (item.title || item.description || item.severity)
+            );
+            
+            if (hasIncidentLikeObjects) {
+              console.log('✅ Found incident-like array in property:', key, 'with', value.length, 'item(s)');
+              return value;
+            }
+          }
+        }
+        
+        console.log('⚠️ Object has no incident-like arrays');
+        
+      } catch (e) {
+        console.log('❌ Failed to parse JSON object:', e.message);
+        continue;
+      }
+    }
+    
+    throw new Error('No JSON objects with incidents property found');
+  }
+
+  /**
+   * Enhanced cleaning strategy - most thorough markdown and formatting removal
+   */
+  parseWithEnhancedCleaning(response) {
+    console.log('🧹 Enhanced cleaning: Processing', response.length, 'character response');
+    let jsonStr = response.trim();
+    
+    // Multi-stage cleaning for complex responses
+    
+    // Stage 1: Remove markdown code blocks and formatting
+    const originalLength = jsonStr.length;
+    jsonStr = jsonStr.replace(/```(?:json|javascript|js)?\s*/gi, ''); // Opening blocks
+    jsonStr = jsonStr.replace(/```\s*$/gm, ''); // Closing blocks  
+    jsonStr = jsonStr.replace(/`{1,2}[^`]*`{1,2}/g, ''); // Inline code
+    console.log('📝 Stage 1 (markdown removal):', originalLength, '→', jsonStr.length, 'chars');
+    
+    // Stage 2: Remove AI response wrapper text
+    const stage2Length = jsonStr.length;
+    jsonStr = jsonStr.replace(/^.*?(?=\[|\{)/s, ''); // Everything before JSON starts
+    jsonStr = jsonStr.replace(/(?<=\]|\}).*$/s, ''); // Everything after JSON ends
+    console.log('📝 Stage 2 (wrapper removal):', stage2Length, '→', jsonStr.length, 'chars');
+    
+    // Stage 3: Clean up whitespace and formatting
+    const stage3Length = jsonStr.length;
+    jsonStr = jsonStr.replace(/^[^\[\{]*/, '').replace(/[^\]\}]*$/, '');
+    jsonStr = jsonStr.trim();
+    console.log('📝 Stage 3 (whitespace cleanup):', stage3Length, '→', jsonStr.length, 'chars');
+    
+    // Stage 4: Extract the most likely JSON array (prioritize incident-like content)
+    const jsonMatches = jsonStr.match(/\[[\s\S]*\]/g) || [];
+    if (jsonMatches.length > 0) {
+      // Prioritize arrays that likely contain incidents (have "title" and "description")
+      const incidentLikeMatches = jsonMatches.filter(match => 
+        match.includes('"title"') && match.includes('"description"')
+      );
+      
+      if (incidentLikeMatches.length > 0) {
+        // Pick the largest incident-like match
+        jsonStr = incidentLikeMatches.sort((a, b) => b.length - a.length)[0];
+        console.log('📝 Stage 4 (JSON extraction): Selected', jsonStr.length, 'char INCIDENT-LIKE array from', jsonMatches.length, 'total matches');
+      } else {
+        // Fall back to largest match
+        jsonStr = jsonMatches.sort((a, b) => b.length - a.length)[0];
+        console.log('📝 Stage 4 (JSON extraction): Selected', jsonStr.length, 'char LARGEST array from', jsonMatches.length, 'matches (no incident-like found)');
+      }
+    } else {
+      console.log('📝 Stage 4 (JSON extraction): No JSON arrays found');
+    }
+    
+    // Stage 5: Final cleanup - fix common JSON issues
+    const stage5Length = jsonStr.length;
+    // Remove trailing commas before closing brackets
+    jsonStr = jsonStr.replace(/,(\s*[\]\}])/g, '$1');
+    // Fix common escape issues
+    jsonStr = jsonStr.replace(/\\\\/g, '\\');
+    console.log('📝 Stage 5 (JSON cleanup):', stage5Length, '→', jsonStr.length, 'chars');
+    
+    console.log('🎯 Final JSON string length:', jsonStr.length);
+    console.log('🎯 First 100 chars:', jsonStr.substring(0, 100));
+    
+    return JSON.parse(jsonStr);
+  }
+
+  /**
+   * Fallback extraction strategy - find JSON within mixed content
+   */
+  parseWithFallbackExtraction(response) {
+    console.log('🔍 Fallback extraction: Looking for JSON arrays in', response.length, 'character response');
+    
+    // Strategy 1: Look for greedy JSON arrays (complete structures)
+    const greedyMatches = response.match(/\[[\s\S]*\]/g) || [];
+    console.log('📋 Found', greedyMatches.length, 'greedy array matches');
+    
+    // Strategy 2: Look for incident-like arrays (containing objects with title/description)
+    const incidentMatches = response.match(/\[[\s\S]*?(?:"title"|"description")[\s\S]*?\]/g) || [];
+    console.log('📋 Found', incidentMatches.length, 'incident-like array matches');
+    
+    // Combine and prioritize matches
+    const allMatches = [
+      ...incidentMatches.map(m => ({ match: m, priority: 3, type: 'incident-like' })),
+      ...greedyMatches.map(m => ({ match: m, priority: 2, type: 'greedy' })),
+    ];
+    
+    // Remove duplicates and sort by priority then size
+    const uniqueMatches = allMatches
+      .filter((item, index, array) => array.findIndex(i => i.match === item.match) === index)
+      .sort((a, b) => {
+        if (a.priority !== b.priority) return b.priority - a.priority;
+        return b.match.length - a.match.length;
+      });
+    
+    console.log('🎯 Processing', uniqueMatches.length, 'unique matches in priority order');
+    
+    for (const { match, type } of uniqueMatches) {
+      try {
+        console.log('🧪 Trying', type, 'match (length:', match.length + ')');
+        const parsed = JSON.parse(match);
+        
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          // Check if array contains object-like structures
+          const hasObjects = parsed.some(item => 
+            item && typeof item === 'object' && !Array.isArray(item)
+          );
+          
+          if (hasObjects) {
+            console.log('✅ Found valid array with', parsed.length, 'object(s) using', type, 'strategy');
+            return parsed;
+          } else {
+            console.log('⚠️ Array contains non-objects, skipping');
+          }
+        } else {
+          console.log('⚠️ Not a non-empty array, skipping');
+        }
+      } catch (e) {
+        console.log('❌ JSON parse failed for', type, 'match:', e.message);
+        continue;
+      }
+    }
+    
+    throw new Error('No valid JSON array found in response');
+  }
+
+  /**
+   * Basic cleaning strategy - minimal processing (original logic)
+   */
+  parseWithBasicCleaning(response) {
+    let jsonStr = response.trim();
+    jsonStr = jsonStr.replace(/```json\s*/, '').replace(/```\s*$/, '');
+    jsonStr = jsonStr.replace(/^[^\[\{]*/, '').replace(/[^\]\}]*$/, '');
+    
+    const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
+    if (jsonMatch) {
+      jsonStr = jsonMatch[0];
+    }
+    
+    return JSON.parse(jsonStr);
+  }
+
+  /**
+   * Parse AI response for assets
+   */
+  parseAssetResponse(response) {
+    try {
+      console.log('🔍 Parsing asset response, length:', response?.length || 0);
+      
+      if (!response || response.trim().length === 0) {
+        throw new Error('Empty AI response - no data received from AI service');
+      }
+      
+      let jsonStr = response.trim();
+      
+      // Remove markdown code blocks
+      jsonStr = jsonStr.replace(/```json\s*/, '').replace(/```\s*$/, '');
+      
+      // Remove any leading/trailing non-JSON content
+      jsonStr = jsonStr.replace(/^[^[\{]*/, '').replace(/[^\]\}]*$/, '');
+      
+      // Try to extract JSON array
+      const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        jsonStr = jsonMatch[0];
+      }
+      
+      // Parse JSON with detailed error information
+      let assets;
+      try {
+        assets = JSON.parse(jsonStr);
+      } catch (parseError) {
+        console.error('JSON parse error details:', {
+          error: parseError.message,
+          responseLength: response.length,
+          jsonLength: jsonStr.length,
+          position: parseError.message.match(/position (\d+)/)?.[1]
+        });
+        
+        // Log the problematic area for debugging
+        const position = parseInt(parseError.message.match(/position (\d+)/)?.[1] || '0');
+        if (position > 0) {
+          const start = Math.max(0, position - 100);
+          const end = Math.min(jsonStr.length, position + 100);
+          console.error('Problematic JSON area around position', position, ':', jsonStr.substring(start, end));
+        }
+        
+        // Log first 500 and last 500 characters for debugging
+        console.error('AI response start:', response.substring(0, 500));
+        console.error('AI response end:', response.substring(Math.max(0, response.length - 500)));
+        
+        throw parseError;
+      }
+      
+      // Validate that we got an array
+      if (!Array.isArray(assets)) {
+        throw new Error('AI response is not a valid JSON array');
+      }
+      
+      // Validate and filter assets with strict validation
+      const validAssets = assets.filter(asset => 
+        asset && 
+        typeof asset === 'object' &&
+        asset.name && 
+        asset.assetType
+      );
+      
+      if (validAssets.length === 0) {
+        throw new Error('No valid assets found in AI response - all assets missing required fields (name, assetType)');
+      }
+      
+      console.log(`✅ Successfully parsed ${validAssets.length} valid assets from AI response`);
+      
+      return validAssets.map(asset => ({
+        ...asset,
+        lastSeen: asset.lastSeen || new Date().toISOString(),
+        firstDiscovered: asset.firstDiscovered || new Date().toISOString(),
+        criticality: asset.criticality || 'medium',
+        environment: asset.environment || 'production',
+        metadata: asset.metadata || {},
+      }));
+      
+    } catch (error) {
+      console.error('Failed to parse asset response:', error.message);
+      throw new Error(`Failed to parse AI response for assets: ${error.message}`);
+    }
+  }
+
+  /**
+   * Parse AI response for IOCs
+   */
+  parseIOCResponse(response) {
+    try {
+      console.log('🔍 Parsing IOC response, length:', response?.length || 0);
+      
+      if (!response || response.trim().length === 0) {
+        throw new Error('Empty AI response - no data received from AI service');
+      }
+      
+      let jsonStr = response.trim();
+      
+      // Remove markdown code blocks
+      jsonStr = jsonStr.replace(/```json\s*/, '').replace(/```\s*$/, '');
+      
+      // Remove any leading/trailing non-JSON content
+      jsonStr = jsonStr.replace(/^[^[\{]*/, '').replace(/[^\]\}]*$/, '');
+      
+      // Try to extract JSON array
+      const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        jsonStr = jsonMatch[0];
+      }
+      
+      // Parse JSON with detailed error information
+      let iocs;
+      try {
+        iocs = JSON.parse(jsonStr);
+      } catch (parseError) {
+        console.error('JSON parse error details:', {
+          error: parseError.message,
+          responseLength: response.length,
+          jsonLength: jsonStr.length,
+          position: parseError.message.match(/position (\d+)/)?.[1]
+        });
+        
+        // Log the problematic area for debugging
+        const position = parseInt(parseError.message.match(/position (\d+)/)?.[1] || '0');
+        if (position > 0) {
+          const start = Math.max(0, position - 100);
+          const end = Math.min(jsonStr.length, position + 100);
+          console.error('Problematic JSON area around position', position, ':', jsonStr.substring(start, end));
+        }
+        
+        // Log first 500 and last 500 characters for debugging
+        console.error('AI response start:', response.substring(0, 500));
+        console.error('AI response end:', response.substring(Math.max(0, response.length - 500)));
+        
+        throw parseError;
+      }
+      
+      // Validate that we got an array
+      if (!Array.isArray(iocs)) {
+        throw new Error('AI response is not a valid JSON array');
+      }
+      
+      // Validate and filter IOCs with strict validation
+      const validIOCs = iocs.filter(ioc => 
+        ioc && 
+        typeof ioc === 'object' &&
+        ioc.type && 
+        ioc.value && 
+        ioc.confidence &&
+        ioc.severity &&
+        Number.isInteger(ioc.severity) &&
+        ioc.severity >= 1 && 
+        ioc.severity <= 5
+      );
+      
+      if (validIOCs.length === 0) {
+        throw new Error('No valid IOCs found in AI response - all IOCs missing required fields (type, value, confidence, valid severity 1-5)');
+      }
+      
+      console.log(`✅ Successfully parsed ${validIOCs.length} valid IOCs from AI response`);
+      
+      return validIOCs.map(ioc => ({
+        ...ioc,
+        firstSeen: ioc.firstSeen || new Date().toISOString(),
+        lastSeen: ioc.lastSeen || new Date().toISOString(),
+        isActive: ioc.isActive !== undefined ? ioc.isActive : true,
+        tags: ioc.tags || [],
+        mitreAttack: ioc.mitreAttack || [],
+        source: ioc.source || 'Test Generator',
+      }));
+      
+    } catch (error) {
+      console.error('Failed to parse IOC response:', error.message);
+      throw new Error(`Failed to parse AI response for IOCs: ${error.message}`);
+    }
+  }
+
+  /**
+   * Parse AI response for playbooks
+   */
+  parsePlaybookResponse(response) {
+    try {
+      console.log('🔍 Parsing playbook response, length:', response?.length || 0);
+      
+      if (!response || response.trim().length === 0) {
+        throw new Error('Empty AI response - no data received from AI service');
+      }
+      
+      let jsonStr = response.trim();
+      
+      // Remove markdown code blocks
+      jsonStr = jsonStr.replace(/```json\s*/, '').replace(/```\s*$/, '');
+      
+      // Remove any leading/trailing non-JSON content
+      jsonStr = jsonStr.replace(/^[^[\{]*/, '').replace(/[^\]\}]*$/, '');
+      
+      // Try to extract JSON array
+      const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        jsonStr = jsonMatch[0];
+      }
+      
+      // Parse JSON with detailed error information
+      let playbooks;
+      try {
+        playbooks = JSON.parse(jsonStr);
+      } catch (parseError) {
+        console.error('JSON parse error details:', {
+          error: parseError.message,
+          responseLength: response.length,
+          jsonLength: jsonStr.length,
+          position: parseError.message.match(/position (\d+)/)?.[1]
+        });
+        
+        // Log the problematic area for debugging
+        const position = parseInt(parseError.message.match(/position (\d+)/)?.[1] || '0');
+        if (position > 0) {
+          const start = Math.max(0, position - 100);
+          const end = Math.min(jsonStr.length, position + 100);
+          console.error('Problematic JSON area around position', position, ':', jsonStr.substring(start, end));
+        }
+        
+        // Log first 500 and last 500 characters for debugging
+        console.error('AI response start:', response.substring(0, 500));
+        console.error('AI response end:', response.substring(Math.max(0, response.length - 500)));
+        
+        throw parseError;
+      }
+      
+      // Validate that we got an array
+      if (!Array.isArray(playbooks)) {
+        throw new Error('AI response is not a valid JSON array');
+      }
+      
+      // Validate and filter playbooks with strict validation
+      const validPlaybooks = playbooks.filter(playbook => 
+        playbook && 
+        typeof playbook === 'object' &&
+        playbook.name && 
+        playbook.description && 
+        playbook.category &&
+        Array.isArray(playbook.steps) &&
+        playbook.steps.length > 0
+      );
+      
+      if (validPlaybooks.length === 0) {
+        throw new Error('No valid playbooks found in AI response - all playbooks missing required fields (name, description, category, non-empty steps array)');
+      }
+      
+      console.log(`✅ Successfully parsed ${validPlaybooks.length} valid playbooks from AI response`);
+      
+      return validPlaybooks.map(playbook => ({
+        ...playbook,
+        triggerType: playbook.triggerType || 'manual',
+        isActive: playbook.isActive !== undefined ? playbook.isActive : true,
+        executionCount: playbook.executionCount || 0,
+        successRate: playbook.successRate || 85,
+        averageExecutionTime: playbook.averageExecutionTime || 3600,
+        steps: playbook.steps.map((step, index) => ({
+          ...step,
+          order: step.order || (index + 1),
+          timeout: step.timeout || 300,
+          isRequired: step.isRequired !== undefined ? step.isRequired : true,
+        })),
+      }));
+      
+    } catch (error) {
+      console.error('Failed to parse playbook response:', error.message);
+      throw new Error(`Failed to parse AI response for playbooks: ${error.message}`);
+    }
+  }
+
+  /**
+   * Parse AI response for threat actors
+   */
+  parseThreatActorResponse(response) {
+    try {
+      console.log('🔍 Parsing threat actor response, length:', response?.length || 0);
+      
+      if (!response || response.trim().length === 0) {
+        throw new Error('Empty AI response - no data received from AI service');
+      }
+      
+      let jsonStr = response.trim();
+      
+      // Remove markdown code blocks
+      jsonStr = jsonStr.replace(/```json\s*/, '').replace(/```\s*$/, '');
+      
+      // Remove any leading/trailing non-JSON content
+      jsonStr = jsonStr.replace(/^[^[\{]*/, '').replace(/[^\]\}]*$/, '');
+      
+      // Remove JSON comments (common issue with AI responses)
+      jsonStr = jsonStr.replace(/\/\*[\s\S]*?\*\//g, ''); // Remove /* ... */ comments
+      jsonStr = jsonStr.replace(/\/\/.*$/gm, ''); // Remove // comments
+      
+      // Remove other problematic characters that can appear in AI responses
+      jsonStr = jsonStr.replace(/\\n/g, ' '); // Replace literal \n with space
+      jsonStr = jsonStr.replace(/\\t/g, ' '); // Replace literal \t with space
+      jsonStr = jsonStr.replace(/\\r/g, ' '); // Replace literal \r with space
+      jsonStr = jsonStr.replace(/[\x00-\x1F\x7F]/g, ' '); // Remove control characters
+      
+      // Additional aggressive cleaning for problematic AI responses
+      jsonStr = jsonStr.replace(/\/([^"]*?)\//g, ' $1 '); // Replace /text/ patterns with space text space
+      jsonStr = jsonStr.replace(/\\+/g, '\\'); // Fix multiple backslashes
+      jsonStr = jsonStr.replace(/\s+/g, ' '); // Collapse multiple spaces
+      
+      // Handle specific patterns that cause parsing errors
+      jsonStr = jsonStr.replace(/\\\\/g, '/'); // Replace double backslashes before slash with single slash
+      jsonStr = jsonStr.replace(/([^":])\/([^"]+)\/([^"]*)/g, '$1 $2 $3'); // Replace unquoted /text/ patterns
+      jsonStr = jsonStr.replace(/"([^"]*)\/([^"]*)"/g, '"$1 $2"'); // Fix slashes inside quoted strings
+      
+      // Remove trailing commas before closing brackets (common AI error)
+      jsonStr = jsonStr.replace(/,(\s*[}\]])/g, '$1');
+      
+      // Try to extract JSON array
+      const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        jsonStr = jsonMatch[0];
+      }
+      
+      // Parse JSON with detailed error information
+      let threatActors;
+      try {
+        threatActors = JSON.parse(jsonStr);
+      } catch (parseError) {
+        console.error('JSON parse error details:', {
+          error: parseError.message,
+          responseLength: response.length,
+          jsonLength: jsonStr.length,
+          position: parseError.message.match(/position (\d+)/)?.[1]
+        });
+        
+        // Log the problematic area for debugging
+        const position = parseInt(parseError.message.match(/position (\d+)/)?.[1] || '0');
+        if (position > 0) {
+          const start = Math.max(0, position - 100);
+          const end = Math.min(jsonStr.length, position + 100);
+          console.error('Problematic JSON area around position', position, ':', jsonStr.substring(start, end));
+        }
+        
+        // Log first 500 and last 500 characters for debugging
+        console.error('AI response start:', response.substring(0, 500));
+        console.error('AI response end:', response.substring(Math.max(0, response.length - 500)));
+        
+        throw parseError;
+      }
+      
+      // Validate that we got an array
+      if (!Array.isArray(threatActors)) {
+        throw new Error('AI response is not a valid JSON array');
+      }
+      
+      // Validate and filter threat actors with strict validation
+      const validThreatActors = threatActors.filter(actor => 
+        actor && 
+        typeof actor === 'object' &&
+        actor.name && 
+        actor.description && 
+        actor.sophistication &&
+        ['basic', 'intermediate', 'advanced', 'expert'].includes(actor.sophistication)
+      );
+      
+      if (validThreatActors.length === 0) {
+        throw new Error('No valid threat actors found in AI response - all actors missing required fields (name, description, valid sophistication level)');
+      }
+      
+      console.log(`✅ Successfully parsed ${validThreatActors.length} valid threat actors from AI response`);
+      
+      return validThreatActors.map(actor => ({
+        ...actor,
+        aliases: actor.aliases || [],
+        motivation: actor.motivation || [],
+        targetSectors: actor.targetSectors || [],
+        techniques: actor.techniques || [],
+        campaigns: actor.campaigns || [],
+        isActive: actor.isActive !== undefined ? actor.isActive : true,
+        firstSeen: actor.firstSeen || new Date().toISOString(),
+        lastSeen: actor.lastSeen || new Date().toISOString(),
+        metadata: actor.metadata || {},
+      }));
+      
+    } catch (error) {
+      console.error('Failed to parse threat actor response:', error.message);
+      throw new Error(`Failed to parse AI response for threat actors: ${error.message}`);
+    }
+  }
+
+  /**
+   * Parse AI response for threat campaigns
+   */
+  parseThreatCampaignResponse(response) {
+    try {
+      console.log('🔍 Parsing threat campaign response, length:', response?.length || 0);
+      
+      if (!response || response.trim().length === 0) {
+        throw new Error('Empty AI response - no data received from AI service');
+      }
+      
+      let jsonStr = response.trim();
+      
+      // Remove markdown code blocks
+      jsonStr = jsonStr.replace(/```json\s*/, '').replace(/```\s*$/, '');
+      
+      // Remove any leading/trailing non-JSON content
+      jsonStr = jsonStr.replace(/^[^[\{]*/, '').replace(/[^\]\}]*$/, '');
+      
+      // Remove JSON comments (common issue with AI responses)
+      jsonStr = jsonStr.replace(/\/\*[\s\S]*?\*\//g, ''); // Remove /* ... */ comments
+      jsonStr = jsonStr.replace(/\/\/.*$/gm, ''); // Remove // comments
+      
+      // Remove other problematic characters that can appear in AI responses
+      jsonStr = jsonStr.replace(/\\n/g, ' '); // Replace literal \n with space
+      jsonStr = jsonStr.replace(/\\t/g, ' '); // Replace literal \t with space
+      jsonStr = jsonStr.replace(/\\r/g, ' '); // Replace literal \r with space
+      jsonStr = jsonStr.replace(/[\x00-\x1F\x7F]/g, ' '); // Remove control characters
+      
+      // Additional aggressive cleaning for problematic AI responses
+      jsonStr = jsonStr.replace(/\/([^"]*?)\//g, ' $1 '); // Replace /text/ patterns with space text space
+      jsonStr = jsonStr.replace(/\\+/g, '\\'); // Fix multiple backslashes
+      jsonStr = jsonStr.replace(/\s+/g, ' '); // Collapse multiple spaces
+      
+      // Handle specific patterns that cause parsing errors
+      jsonStr = jsonStr.replace(/\\\\/g, '/'); // Replace double backslashes before slash with single slash
+      jsonStr = jsonStr.replace(/([^":])\/([^"]+)\/([^"]*)/g, '$1 $2 $3'); // Replace unquoted /text/ patterns
+      jsonStr = jsonStr.replace(/"([^"]*)\/([^"]*)"/g, '"$1 $2"'); // Fix slashes inside quoted strings
+      
+      // Remove trailing commas before closing brackets (common AI error)
+      jsonStr = jsonStr.replace(/,(\s*[}\]])/g, '$1');
+      
+      // Try to extract JSON array
+      const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        jsonStr = jsonMatch[0];
+      }
+      
+      // Parse JSON with detailed error information
+      let threatCampaigns;
+      try {
+        threatCampaigns = JSON.parse(jsonStr);
+      } catch (parseError) {
+        console.error('JSON parse error details:', {
+          error: parseError.message,
+          responseLength: response.length,
+          jsonLength: jsonStr.length,
+          position: parseError.message.match(/position (\d+)/)?.[1]
+        });
+        
+        // Log the problematic area for debugging
+        const position = parseInt(parseError.message.match(/position (\d+)/)?.[1] || '0');
+        if (position > 0) {
+          const start = Math.max(0, position - 100);
+          const end = Math.min(jsonStr.length, position + 100);
+          console.error('Problematic JSON area around position', position, ':', jsonStr.substring(start, end));
+        }
+        
+        // Log first 500 and last 500 characters for debugging
+        console.error('AI response start:', response.substring(0, 500));
+        console.error('AI response end:', response.substring(Math.max(0, response.length - 500)));
+        
+        throw parseError;
+      }
+      
+      // Validate that we got an array
+      if (!Array.isArray(threatCampaigns)) {
+        throw new Error('AI response is not a valid JSON array');
+      }
+      
+      // Validate and filter threat campaigns with strict validation
+      const validCampaigns = threatCampaigns.filter(campaign => 
+        campaign && 
+        typeof campaign === 'object' &&
+        campaign.name && 
+        typeof campaign.name === 'string' &&
+        campaign.name.trim().length >= 2 &&
+        campaign.name.trim().length <= 200 &&
+        campaign.description && 
+        typeof campaign.description === 'string' &&
+        campaign.description.trim().length >= 10 &&
+        campaign.description.trim().length <= 5000 &&
+        campaign.confidence &&
+        ['low', 'medium', 'high', 'very_high'].includes(campaign.confidence) &&
+        campaign.severity &&
+        Number.isInteger(campaign.severity) &&
+        campaign.severity >= 1 && 
+        campaign.severity <= 5
+      );
+      
+      if (validCampaigns.length === 0) {
+        throw new Error('No valid threat campaigns found in AI response - all campaigns must have: name (2-200 chars), description (10-5000 chars), valid confidence level, and severity 1-5');
+      }
+      
+      console.log(`✅ Successfully parsed ${validCampaigns.length} valid threat campaigns from AI response`);
+      
+      return validCampaigns.map(campaign => ({
+        ...campaign,
+        name: campaign.name.trim(),
+        description: campaign.description.trim(),
+        startDate: campaign.startDate || new Date().toISOString(),
+        endDate: campaign.endDate || null,
+        isActive: campaign.isActive !== undefined ? campaign.isActive : true,
+        targetSectors: campaign.targetSectors || [],
+        targetGeographies: campaign.targetGeographies || [],
+        techniques: campaign.techniques || [],
+        objectives: campaign.objectives || [],
+        victimCount: campaign.victimCount || 0,
+        associatedIOCs: campaign.associatedIOCs || [],
+        relatedIncidents: campaign.relatedIncidents || [],
+        tags: campaign.tags || [],
+        metadata: campaign.metadata || {},
+      }));
+      
+    } catch (error) {
+      console.error('Failed to parse threat campaign response:', error.message);
+      throw new Error(`Failed to parse AI response for threat campaigns: ${error.message}`);
+    }
+  }
+
+  /**
+   * Get time context for prompts
+   */
+  getTimeContext(timeRange) {
+    const now = new Date();
+    switch (timeRange) {
+      case 'last_24h':
+        return `within the last 24 hours (${new Date(now - 24 * 60 * 60 * 1000).toISOString()} to ${now.toISOString()})`;
+      case 'last_7d':
+        return `within the last 7 days (${new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString()} to ${now.toISOString()})`;
+      case 'last_30d':
+        return `within the last 30 days (${new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString()} to ${now.toISOString()})`;
+      default:
+        return 'within recent timeframe';
+    }
+  }
+
+  /**
+   * Convert severity level names to numbers
+   */
+  getSeverityNumber(level) {
+    const mapping = {
+      info: 1,
+      low: 2,
+      medium: 3,
+      high: 4,
+      critical: 5,
+    };
+    return mapping[level] || 3;
+  }
+
+
+
+
+
+
+  /**
+   * Generate random MAC address
+   */
+  generateMACAddress() {
+    const hexChars = '0123456789ABCDEF';
+    let mac = '';
+    for (let i = 0; i < 6; i++) {
+      if (i > 0) mac += ':';
+      mac += hexChars[Math.floor(Math.random() * 16)];
+      mac += hexChars[Math.floor(Math.random() * 16)];
+    }
+    return mac;
+  }
+
+
+  /**
+   * Store generation context for later end-to-end logging
+   * This replaces immediate success/failure logging
+   */
+  _storeGenerationContext(context) {
+    // Store context in instance variable for later use by test data controller
+    this._lastGenerationContext = context;
+    console.log(`🔄 AI generation context stored: ${context.dataType} - ${context.aiSuccess ? 'AI Success' : 'AI Failed'} - waiting for database verification`);
+  }
+
+  /**
+   * Get stored generation context (used by test data controller)
+   */
+  getLastGenerationContext() {
+    return this._lastGenerationContext || null;
+  }
+
+  /**
+   * Clear stored generation context
+   */
+  clearGenerationContext() {
+    this._lastGenerationContext = null;
+  }
+
+  /**
+   * Log AI generation activity
+   */
+  async logAIGeneration(logData) {
+    try {
+      await models.AIGenerationLog.create({
+        userId: logData.userId,
+        organizationId: logData.organizationId,
+        dataType: logData.dataType,
+        quantity: logData.quantity,
+        scenario: logData.scenario,
+        prompt: logData.prompt,
+        aiResponse: logData.aiResponse,
+        success: logData.success,
+        errorMessage: logData.errorMessage,
+        executionTime: logData.executionTime,
+        aiModel: logData.aiModel,
+        aiProvider: logData.aiProvider,
+        aiEndpoint: logData.aiEndpoint,
+        modelVersion: logData.modelVersion,
+        providerMetadata: logData.providerMetadata,
+        metadata: logData.metadata,
+      });
+      
+      console.log(`✅ AI generation logged: ${logData.dataType} - ${logData.success ? 'Success' : 'Failed'} - Provider: ${logData.aiProvider || 'Unknown'}`);
+    } catch (error) {
+      console.error('❌ Failed to log AI generation:', error);
+      // Don't throw - logging should not break main functionality
+    }
+  }
+
+  /**
+   * Log complete end-to-end AI generation result including database verification
+   */
+  async logAIGenerationResult(logData) {
+    try {
+      // Determine overall success based on both AI generation and database verification
+      const overallSuccess = logData.aiSuccess && logData.databaseSuccess;
+      
+      // Determine validation status based on AI generation and database creation success
+      let validationStatus = 'Unknown';
+      if (logData.aiSuccess === false) {
+        validationStatus = 'Fail'; // AI generation failed
+      } else if (logData.aiSuccess === true && logData.databaseSuccess === true) {
+        // Check if record counts match
+        if (logData.verificationDetails && 
+            logData.verificationDetails.expected === logData.verificationDetails.verified) {
+          validationStatus = 'Pass'; // AI generated and all records created successfully
+        } else {
+          validationStatus = 'Fail'; // AI succeeded but not all records were created
+        }
+      } else if (logData.aiSuccess === true && logData.databaseSuccess === false) {
+        validationStatus = 'Fail'; // AI succeeded but database creation failed
+      } else {
+        validationStatus = 'Pending'; // Still in progress or unknown state
+      }
+      
+      // Build comprehensive error message if needed
+      let errorMessage = null;
+      if (!overallSuccess) {
+        if (!logData.aiSuccess) {
+          errorMessage = logData.aiError || 'AI generation failed';
+        } else if (!logData.databaseSuccess) {
+          errorMessage = `AI generation successful but database save failed: ${logData.databaseError || 'Unknown database error'}`;
+          if (logData.verificationDetails) {
+            errorMessage += ` (${logData.verificationDetails.verified}/${logData.verificationDetails.expected} records saved)`;
+          }
+        }
+      }
+
+      // Build comprehensive metadata including verification results
+      const comprehensiveMetadata = {
+        ...(logData.metadata || {}),
+        aiGenerationSuccess: logData.aiSuccess,
+        databaseSuccess: logData.databaseSuccess,
+        endToEndSuccess: overallSuccess,
+        verificationResults: logData.verificationDetails ? {
+          recordsExpected: logData.verificationDetails.expected,
+          recordsVerified: logData.verificationDetails.verified,
+          recordsMissing: logData.verificationDetails.missing?.length || 0,
+          missingIds: logData.verificationDetails.missing || [],
+          existingIds: logData.verificationDetails.existing || [],
+          verificationError: logData.verificationDetails.error
+        } : null
+      };
+
+      await models.AIGenerationLog.create({
+        userId: logData.userId,
+        organizationId: logData.organizationId,
+        dataType: logData.dataType,
+        quantity: logData.quantity,
+        scenario: logData.scenario,
+        prompt: logData.prompt,
+        aiResponse: logData.aiResponse,
+        success: overallSuccess, // Only true if both AI and DB succeeded
+        validation: validationStatus, // Pass/Fail/Pending/Unknown based on end-to-end validation
+        errorMessage: errorMessage,
+        executionTime: logData.totalExecutionTime,
+        aiModel: logData.aiModel,
+        aiProvider: logData.aiProvider,
+        aiEndpoint: logData.aiEndpoint,
+        modelVersion: logData.modelVersion,
+        providerMetadata: logData.providerMetadata,
+        metadata: comprehensiveMetadata,
+      });
+      
+      const statusText = overallSuccess ? 'End-to-End Success' : 'Failed';
+      const stageText = !logData.aiSuccess ? 'AI Generation Failed' : 
+                       !logData.databaseSuccess ? 'Database Save Failed' : 'Unknown Error';
+      
+      console.log(`📊 Complete AI generation result logged: ${logData.dataType} - ${statusText} ${!overallSuccess ? `(${stageText})` : ''} - Validation: ${validationStatus} - Provider: ${logData.aiProvider || 'Unknown'}`);
+    } catch (error) {
+      console.error('❌ Failed to log AI generation result:', error);
+      // Don't throw - logging should not break main functionality
+    }
+  }
+}
+
+module.exports = new AIGenerationService();

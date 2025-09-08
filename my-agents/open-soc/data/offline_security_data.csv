@@ -1,0 +1,6 @@
+alert_id,alert_type,severity,description,affected_systems,timestamp,expected_classification,expected_severity
+1,Malware Detection,Critical,Trojan.Win32.Emotet detected on workstation WS-001,WS-001,2025-01-15T14:23:12Z,malware_infection,critical
+2,Suspicious Network Activity,High,Unusual outbound connections to known C2 server 192.168.1.100,WS-002;SRV-001,2025-01-15T15:45:30Z,network_intrusion,high  
+3,Unauthorized Access,High,Failed login attempts followed by successful login from suspicious IP,SRV-DB-001,2025-01-15T16:12:45Z,unauthorized_access,high
+4,Data Exfiltration,Critical,Large data transfer to external IP during off-hours,SRV-FILE-001,2025-01-15T02:30:15Z,data_exfiltration,critical
+5,Phishing Attack,Medium,Suspicious email with malicious attachment detected,WS-003;WS-004,2025-01-15T10:15:22Z,phishing_attack,medium
