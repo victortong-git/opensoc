@@ -20,7 +20,9 @@
 
 **🔗 Official Website**: [https://c6web.com/opensoc/](https://c6web.com/opensoc/)
 
-**📺 Demo YouTube Video**: [OpenSOC Demo](https://www.youtube.com/watch?v=81_H2NIq5Ag)
+**📺 Demo YouTube Video**: [OpenSOC Demo #1](https://www.youtube.com/watch?v=81_H2NIq5Ag)
+
+**📺 Demo YouTube Video**: [OpenSOC Demo #2](https://youtu.be/K7OJtE3zkTM)
 
 Visit our official website for comprehensive resources:
 - **📚 Detailed Documentation** - Complete guides and tutorials  
